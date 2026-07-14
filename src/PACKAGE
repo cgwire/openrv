@@ -1,0 +1,7 @@
+package: My Plugin
+author: Your Name
+version: 1.0
+
+modes:
+  - file: kitsu.py
+    load: immediate

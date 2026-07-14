@@ -1,3 +1,13 @@
+## Development
+
+1. Package the plugin for OpenRV:
+
+```bash
+./package.sh
+```
+
+2. Install the package in OpenRV > Preferences > Packages > Add Packages
+
 ## TODO
 
 A user should be able to connect to kitsu, select revisions to review, download them, annotate, comment, and export back to kitsu.
