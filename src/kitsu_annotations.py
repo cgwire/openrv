@@ -8,31 +8,33 @@ Proof-of-concept plugin for OpenRV that lets a user:
   3. Download the revision from Kitsu (real gazu download) and load it into the RV session
   4. Annotate directly on the RV frame using RV's own Paint tools
   5. Add review comments (real gazu comments)
-  6. "Export" comments + annotations (parsed from the RV session graph)
-     back to Kitsu (simulated -- see note below)
+  6. Export comments + annotations (parsed from the RV session graph) back to Kitsu
 
 This plugin is designed to run only inside OpenRV: the panel is docked
 below the review viewport rather than shown as a standalone window.
 
-Login, task listing, preview downloading, and comments now use the real
-Kitsu Python SDK (`gazu`):
-  - gazu.log_in / gazu.log_out                          -- authentication
-  - gazu.task.all_tasks_for_person(person)               -- tasks assigned to the user
-  - gazu.entity.get_entity(entity_id)                    -- shot/asset info for a task
-  - gazu.files.get_all_preview_files_for_task(task)      -- revisions (preview files) for a task
-  - gazu.files.download_preview_file(preview_file, path) -- actual media download
-  - gazu.task.all_comments_for_task(task)                -- comment history for a task
-  - gazu.task.get_task_status(task_status_id)            -- resolve a task's current status
-  - gazu.task.add_comment(task, task_status, comment=...) -- post a new comment
+Login, task listing, preview downloading, comments, and annotation export
+now all use the real Kitsu Python SDK (`gazu`):
+  - gazu.log_in / gazu.log_out                            -- authentication
+  - gazu.task.all_tasks_for_person(person)                 -- tasks assigned to the user
+  - gazu.entity.get_entity(entity_id)                      -- shot/asset info for a task
+  - gazu.files.get_all_preview_files_for_task(task)        -- revisions (preview files) for a task
+  - gazu.files.download_preview_file(preview_file, path)   -- actual media download
+  - gazu.task.all_comments_for_task(task)                  -- comment history for a task
+  - gazu.task.get_task_status(task_status_id)              -- resolve a task's current status
+  - gazu.task.add_comment(task, task_status, comment=...)  -- post a new comment
+  - gazu.files.update_preview_annotations(preview_file,
+        additions=..., updates=..., deletions=...)         -- sync annotations for a preview
 
-Annotation export (the "Annotations exported" part of `_on_export_clicked`)
-is still simulated -- the RV-side node parsing in `_gather_rv_annotations`
-uses the real RV command API where possible, but the exact per-frame paint
-property paths can vary between RV versions/builds -- double check those
-against the RV build you are targeting before shipping. Only the comment
-count in the export summary is now backed by real data (comments are
-posted to Kitsu immediately when added, via `_on_add_comment_clicked`,
-rather than being batched up for export).
+Annotation export (`_on_export_clicked` / `_gather_rv_annotations` /
+`_extract_frame_paint_data`) reads real data out of the RV session graph
+via RV's command API and diffs it against whatever is already stored on
+the Kitsu preview file, then sends only the additions/updates/deletions
+needed. The exact per-frame paint property paths (pen points, text,
+etc.) can vary between RV versions/builds, so the extraction code stays
+defensive -- double check the property layout against the RV build you
+are targeting and extend `_extract_frame_paint_data` if you want more
+detail (e.g. stroke color/width) carried over to Kitsu.
 
 Make sure `gazu` is installed in RV's Python environment:
     pip install gazu
@@ -40,6 +42,7 @@ Make sure `gazu` is installed in RV's Python environment:
 
 import os
 import re
+import json
 from datetime import datetime
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -81,6 +84,12 @@ def _person_display_name(person):
     last = person.get("last_name", "") or ""
     full = f"{first} {last}".strip()
     return full or person.get("email", "Unknown")
+
+
+def _annotation_signature(kind, data):
+    """Stable signature for an annotation's content, used to detect whether
+    a previously-synced annotation needs to be re-sent as an update."""
+    return json.dumps({"type": kind, "data": data}, sort_keys=True, default=str)
 
 
 class KitsuReviewPanel(QtWidgets.QWidget):
@@ -325,6 +334,9 @@ class KitsuReviewPanel(QtWidgets.QWidget):
                 ),
                 "artist": self._display_name(),
                 "date": _format_date(latest_preview.get("created_at") or task.get("updated_at")),
+                # Populated lazily (see _sync_known_annotations) once the
+                # revision is selected and we know what Kitsu already has.
+                "known_annotations": None,
             })
 
         QtWidgets.QApplication.restoreOverrideCursor()
@@ -376,6 +388,7 @@ class KitsuReviewPanel(QtWidgets.QWidget):
         )
 
         self._reload_comments()
+        self._sync_known_annotations(rev)
 
         self.download_btn.setEnabled(True)
         self.export_btn.setEnabled(False)
@@ -406,6 +419,41 @@ class KitsuReviewPanel(QtWidgets.QWidget):
             date = _format_date(comment.get("created_at"))
             text = comment.get("text") or ""
             self.comments_list.addItem(f"[{date}] {author}: {text}")
+
+    def _index_kitsu_annotations(self, preview_file):
+        """Build a {frame: {"id":..., "signature":...}} index from whatever
+        annotations Kitsu already has stored on this preview file.
+
+        Kitsu's annotation objects are free-form beyond an 'id', so this
+        plugin writes its own 'frame'/'type'/'data' fields into each
+        annotation it sends (see _gather_rv_annotations) and reads them
+        back the same way here to figure out what's changed since the
+        last export.
+        """
+        index = {}
+        for anno in (preview_file or {}).get("annotations") or []:
+            frame = anno.get("frame")
+            anno_id = anno.get("id")
+            if frame is None or not anno_id:
+                continue
+            index[frame] = {
+                "id": anno_id,
+                "signature": _annotation_signature(anno.get("type"), anno.get("data")),
+            }
+        return index
+
+    def _sync_known_annotations(self, rev):
+        """Refresh rev['known_annotations'] from the preview file's current
+        state on Kitsu, re-fetching the preview file if needed."""
+        preview_file = rev.get("preview_file")
+        preview_id = (preview_file or {}).get("id")
+        if preview_id:
+            try:
+                preview_file = gazu.files.get_preview_file(preview_id)
+                rev["preview_file"] = preview_file
+            except Exception as exc:
+                print(f"[KitsuReview] Could not refresh preview file {preview_id}: {exc}")
+        rev["known_annotations"] = self._index_kitsu_annotations(preview_file)
 
     def _on_download_clicked(self):
         """Download the selected revision's preview file from Kitsu and
@@ -472,7 +520,52 @@ class KitsuReviewPanel(QtWidgets.QWidget):
             "Use RV's Paint tools to annotate frames directly on the viewport."
         )
 
+    def _extract_frame_paint_data(self, node, frame):
+        """Pull whatever pen/text data RV exposes for one paint node/frame
+        into a plain, JSON-serializable dict.
+
+        NOTE: RV's exact paint property layout (pen stroke point arrays,
+        text properties, color/width, etc.) can vary between RV
+        versions/builds. This stays defensive -- it records what it can
+        find under the node's `frame:<N>.*` properties rather than
+        assuming a fixed schema. Extend this if you need stroke color/
+        width or other detail carried over to Kitsu.
+        """
+        prefix = f"{node}.frame:{frame}."
+        strokes = []
+        texts = []
+
+        try:
+            props = [p for p in rvc.properties(node) if p.startswith(prefix)]
+        except Exception as exc:
+            print(f"[KitsuReview] Could not read properties for {node} frame {frame}: {exc}")
+            return {"strokes": strokes, "texts": texts}
+
+        for prop in props:
+            if ".pen:" in prop and prop.endswith(".points"):
+                try:
+                    points = rvc.getFloatProperty(prop)
+                except Exception:
+                    points = []
+                if points:
+                    strokes.append(list(points))
+            elif ".text:" in prop and prop.endswith(".text"):
+                try:
+                    text_value = rvc.getStringProperty(prop)
+                except Exception:
+                    text_value = []
+                if text_value:
+                    texts.append(list(text_value))
+
+        return {"strokes": strokes, "texts": texts}
+
     def _gather_rv_annotations(self):
+        """Collect the current per-frame paint annotations from the RV
+        session graph, in a shape ready to diff against and send to
+        Kitsu's `update_preview_annotations`.
+
+        Returns a list of dicts: {"frame", "type", "data", "signature"}.
+        """
         annotations = []
 
         try:
@@ -488,6 +581,7 @@ class KitsuReviewPanel(QtWidgets.QWidget):
                 print(f"[KitsuReview] Skipped paint node {node}: {exc}")
                 continue
 
+            frames_with_content = set()
             for prop in all_props:
                 match = _FRAME_ORDER_RE.search(prop)
                 if not match:
@@ -498,7 +592,17 @@ class KitsuReviewPanel(QtWidgets.QWidget):
                 except Exception:
                     order = []
                 if order:  # non-empty -> at least one stroke/text on this frame
-                    annotations.append({"node": node, "frame": frame})
+                    frames_with_content.add(frame)
+
+            for frame in sorted(frames_with_content):
+                data = self._extract_frame_paint_data(node, frame)
+                data["node"] = node
+                annotations.append({
+                    "frame": frame,
+                    "type": "drawing",
+                    "data": data,
+                    "signature": _annotation_signature("drawing", data),
+                })
 
         return annotations
 
@@ -544,15 +648,15 @@ class KitsuReviewPanel(QtWidgets.QWidget):
         self._reload_comments()
 
     def _on_export_clicked(self):
-        # NOTE: comments are now posted to Kitsu immediately (see
-        # _on_add_comment_clicked), so this just reports what's already
-        # there. Annotation export is still simulated -- swap for a real
-        # gazu call (e.g. attaching frame data via a preview/attachment
-        # endpoint) when ready.
+        """Sync RV paint annotations to the selected revision's preview file
+        on Kitsu via gazu.files.update_preview_annotations, and report the
+        current comment count (comments themselves are posted immediately,
+        see _on_add_comment_clicked)."""
         if not self.current_revision:
             return
         rev = self.current_revision
         task = rev["task"]
+        preview_file = rev["preview_file"]
 
         try:
             n_comments = len(gazu.task.all_comments_for_task(task) or [])
@@ -560,13 +664,64 @@ class KitsuReviewPanel(QtWidgets.QWidget):
             print(f"[KitsuReview] Could not fetch comment count for export summary: {exc}")
             n_comments = self.comments_list.count()
 
-        annotations = self._gather_rv_annotations()
-        annotated_frames = sorted({a["frame"] for a in annotations})
+        current_annotations = self._gather_rv_annotations()
+        known = rev.get("known_annotations")
+        if known is None:
+            self._sync_known_annotations(rev)
+            known = rev["known_annotations"]
+            preview_file = rev["preview_file"]
 
-        if annotated_frames:
-            frames_note = f"{len(annotated_frames)} annotated frame(s): {annotated_frames}"
-        else:
-            frames_note = "0 annotated frames"
+        additions = []
+        updates = []
+        seen_frames = set()
+
+        for anno in current_annotations:
+            frame = anno["frame"]
+            seen_frames.add(frame)
+            payload = {"frame": frame, "type": anno["type"], "data": anno["data"]}
+            existing = known.get(frame)
+            if existing is None:
+                additions.append(payload)
+            elif existing["signature"] != anno["signature"]:
+                updates.append({**payload, "id": existing["id"]})
+            # else: unchanged, nothing to send
+
+        deletions = [
+            info["id"] for frame, info in known.items() if frame not in seen_frames
+        ]
+
+        if not (additions or updates or deletions):
+            QtWidgets.QMessageBox.information(
+                self, "Kitsu",
+                "Export complete!\n\n"
+                f"Shot: {rev['shot']}\n"
+                f"Task: {rev['task_type']}\n"
+                f"Revision: v{rev['revision']:03d}\n"
+                f"Comments on Kitsu: {n_comments}\n"
+                "Annotations: no changes to sync (RV annotations already match Kitsu)."
+            )
+            return
+
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            updated_preview_file = gazu.files.update_preview_annotations(
+                preview_file,
+                additions=additions or None,
+                updates=updates or None,
+                deletions=deletions or None,
+            )
+        except Exception as exc:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            QtWidgets.QMessageBox.critical(
+                self, "Kitsu", f"Failed to sync annotations to Kitsu: {exc}"
+            )
+            return
+        QtWidgets.QApplication.restoreOverrideCursor()
+
+        # Adopt whatever Kitsu handed back as the new source of truth so the
+        # next export only sends further deltas.
+        rev["preview_file"] = updated_preview_file or preview_file
+        rev["known_annotations"] = self._index_kitsu_annotations(rev["preview_file"])
 
         QtWidgets.QMessageBox.information(
             self, "Kitsu",
@@ -575,9 +730,10 @@ class KitsuReviewPanel(QtWidgets.QWidget):
             f"Task: {rev['task_type']}\n"
             f"Revision: v{rev['revision']:03d}\n"
             f"Comments on Kitsu: {n_comments}\n"
-            f"Annotations exported: {frames_note}\n\n"
-            "(Comments are real and already on Kitsu. Annotation export is still "
-            "mock data -- no annotation request was actually sent to Kitsu.)"
+            f"Annotations added: {len(additions)}\n"
+            f"Annotations updated: {len(updates)}\n"
+            f"Annotations removed: {len(deletions)}\n\n"
+            "Comments and annotations are both now synced to Kitsu."
         )
 
 
