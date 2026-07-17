@@ -40,6 +40,7 @@ Make sure `gazu` is installed in RV's Python environment:
 
 import os
 import re
+import json
 from datetime import datetime
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -50,6 +51,8 @@ import rv.commands as rvc
 import rv.qtutils
 
 import gazu
+
+from map_annotations import convert_openrv_annotations
 
 _FRAME_ORDER_RE = re.compile(r"\bframe:(\d+)\b.*\.order$")
 
@@ -472,6 +475,23 @@ class KitsuReviewPanel(QtWidgets.QWidget):
             "Use RV's Paint tools to annotate frames directly on the viewport."
         )
 
+    def _get_rv_property_value(self, prop):
+        try:
+            info = rvc.propertyInfo(prop)
+        except Exception:
+            return None
+
+        ptype = info.get("type") if isinstance(info, dict) else getattr(info, "type", None)
+
+        if ptype == rvc.FloatType:
+            return rvc.getFloatProperty(prop)
+        elif ptype == rvc.IntType:
+            return rvc.getIntProperty(prop)
+        elif ptype == rvc.StringType:
+            return rvc.getStringProperty(prop)
+        else:
+            return None
+
     def _gather_rv_annotations(self):
         annotations = []
 
@@ -493,13 +513,44 @@ class KitsuReviewPanel(QtWidgets.QWidget):
                 if not match:
                     continue
                 frame = int(match.group(1))
+
                 try:
                     order = rvc.getStringProperty(prop)
                 except Exception:
                     order = []
-                if order:  # non-empty -> at least one stroke/text on this frame
-                    annotations.append({"node": node, "frame": frame})
 
+                if isinstance(order, str):
+                    order = [order]
+                if not order:
+                    continue  # empty -> no strokes/text on this frame
+
+                for item_name in order:
+                    kind = item_name.split(":")[0] if ":" in item_name else item_name
+                    item_prefix = f"{node}.{item_name}."
+
+                    properties = {}
+
+                    _PAIRWISE_KEYS = {"points"}
+
+                    for p in all_props:
+                        if p.startswith(item_prefix):
+                            attr = p[len(item_prefix):]
+                            value = self._get_rv_property_value(p)
+                            if attr in _PAIRWISE_KEYS and isinstance(value, list) and len(value) % 2 == 0:
+                                value = list(zip(value[0::2], value[1::2]))
+                            properties[attr] = value
+
+                    print(properties)
+
+                    annotations.append({
+                        "frame": frame,
+                        "node": node,
+                        "name": item_name,
+                        "type": kind,
+                        "properties": properties,
+                    })
+
+        annotations.sort(key=lambda a: a["frame"])
         return annotations
 
     def _on_add_comment_clicked(self):
@@ -567,6 +618,19 @@ class KitsuReviewPanel(QtWidgets.QWidget):
             frames_note = f"{len(annotated_frames)} annotated frame(s): {annotated_frames}"
         else:
             frames_note = "0 annotated frames"
+
+        # print(annotations)
+        print(annotations)
+
+        records = convert_openrv_annotations(
+            annotations,
+            width=1920,
+            height=1080,
+            fps=24.0,
+            author="5e0ecd69-1559-41a3-b4da-dc1c9d1e0b5c",
+        )
+
+        # print(json.dumps(records, indent=2))
 
         QtWidgets.QMessageBox.information(
             self, "Kitsu",

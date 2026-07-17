@@ -1,1 +1,1 @@
-zip -r kitsu-1.0.rvpkg ./src/PACKAGE ./src/kitsu.py
+zip -r kitsu-1.0.rvpkg ./src/PACKAGE ./src/kitsu.py ./src/map_annotations.py
