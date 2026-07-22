@@ -386,7 +386,6 @@ def convert_openrv_annotations(
         frame_num = shape["frame"] + frame_offset
         by_frame.setdefault(frame_num, []).append(shape)
 
-    print(json.dumps(by_frame, indent=2))
     clock_ms = [int(_time.time() * 1000)]  # mutable shared "wall clock"
     records: List[Dict[str, Any]] = []
 

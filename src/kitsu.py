@@ -53,6 +53,8 @@ import rv.qtutils
 import gazu
 
 from map_annotations import convert_openrv_annotations
+from kitsu_to_openrv import convert_kitsu_annotations
+from openrv_paint_gto import build_paint_gto
 
 _FRAME_ORDER_RE = re.compile(r"\bframe:(\d+)\b.*\.order$")
 
@@ -333,6 +335,7 @@ class KitsuReviewPanel(QtWidgets.QWidget):
         QtWidgets.QApplication.restoreOverrideCursor()
 
         self.revisions = revisions
+        
         self.table.setRowCount(0)
         for row, rev in enumerate(self.revisions):
             self.table.insertRow(row)
@@ -361,6 +364,7 @@ class KitsuReviewPanel(QtWidgets.QWidget):
             self._clear_detail_panel()
             return
         self.current_revision = self.revisions[index]
+
         self._update_detail_panel()
 
     def _clear_detail_panel(self):
@@ -410,6 +414,70 @@ class KitsuReviewPanel(QtWidgets.QWidget):
             text = comment.get("text") or ""
             self.comments_list.addItem(f"[{date}] {author}: {text}")
 
+    def _set_prop(self, full_name, ptype, width, values):
+        if not rvc.propertyExists(full_name):
+            rvc.newProperty(full_name, ptype, width)
+        if ptype == rvc.FloatType:
+            rvc.setFloatProperty(full_name, values, True)
+        elif ptype == rvc.IntType:
+            rvc.setIntProperty(full_name, values, True)
+        elif ptype == rvc.StringType:
+            rvc.setStringProperty(full_name, values, True)
+
+
+    def apply_annotations_live(self, paint_node, openrv_annotations):
+        # ensure the "paint" bookkeeping component exists
+        self._set_prop(f"{paint_node}.paint.show", rvc.IntType, 1, [1])
+
+        next_id = 0
+        frame_order = {}
+
+        for frame_data in openrv_annotations:
+            frame = int(frame_data["frame"])
+
+            for pen in frame_data.get("pens", []):
+                cname = f"pen:{next_id}:{frame}:Kitsu"
+                base = f"{paint_node}.{cname}"
+                points = pen["points"]              # list of (x, y) in NDC
+                width = pen.get("width", 0.003)
+                width_list = width if isinstance(width, list) else [width] * len(points)
+
+                self._set_prop(f"{base}.color", rvc.FloatType, 4, list(pen["color"]))
+                self._set_prop(f"{base}.width", rvc.FloatType, 1, width_list)
+                self._set_prop(f"{base}.brush", rvc.StringType, 1, [pen.get("brush", "circle")])
+                self._set_prop(f"{base}.points", rvc.FloatType, 2,
+                        [c for xy in points for c in xy])   # flatten
+                self._set_prop(f"{base}.debug", rvc.IntType, 1, [0])
+                self._set_prop(f"{base}.join", rvc.IntType, 1, [3])
+                self._set_prop(f"{base}.cap", rvc.IntType, 1, [1])
+                self._set_prop(f"{base}.splat", rvc.IntType, 1, [0])
+
+                frame_order.setdefault(frame, []).append(cname)
+                next_id += 1
+
+            for txt in frame_data.get("texts", []):
+                cname = f"text:{next_id}:{frame}:Kitsu"
+                base = f"{paint_node}.{cname}"
+
+                self._set_prop(f"{base}.position", rvc.FloatType, 2, list(txt["position"]))
+                self._set_prop(f"{base}.color", rvc.FloatType, 4, list(txt.get("color", (1, 1, 1, 1))))
+                self._set_prop(f"{base}.spacing", rvc.FloatType, 1, [txt.get("spacing", 0.8)])
+                self._set_prop(f"{base}.size", rvc.FloatType, 1, [txt.get("size", 0.05)])
+                self._set_prop(f"{base}.scale", rvc.FloatType, 1, [txt.get("scale", 1)])
+                self._set_prop(f"{base}.rotation", rvc.FloatType, 1, [txt.get("rotation", 0)])
+                self._set_prop(f"{base}.font", rvc.StringType, 1, [""])
+                self._set_prop(f"{base}.text", rvc.StringType, 1, [txt["text"]])
+                self._set_prop(f"{base}.origin", rvc.StringType, 1, [""])
+                self._set_prop(f"{base}.debug", rvc.IntType, 1, [0])
+
+                frame_order.setdefault(frame, []).append(cname)
+                next_id += 1
+
+        for frame, names in frame_order.items():
+            self._set_prop(f"{paint_node}.frame:{frame}.order", rvc.StringType, 1, names)
+
+        rvc.redraw()
+
     def _on_download_clicked(self):
         """Download the selected revision's preview file from Kitsu and
         load it into the current RV session."""
@@ -417,6 +485,18 @@ class KitsuReviewPanel(QtWidgets.QWidget):
             return
         rev = self.current_revision
         preview_file = rev["preview_file"]
+        kitsu_annotations = preview_file['annotations']
+
+        openrv_annotations = convert_kitsu_annotations(
+            kitsu_annotations, 
+            width=rev['preview_file']['width'],
+            height=rev['preview_file']['height'],
+            canvas_width=None, 
+            canvas_height=None, 
+            frame_offset=0
+        )
+
+        print(openrv_annotations)
 
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
         original_name = preview_file.get("original_name") or preview_file.get("id", "revision")
@@ -462,9 +542,16 @@ class KitsuReviewPanel(QtWidgets.QWidget):
         progress.close()
 
         try:
-            rvc.addSourceVerbose([file_path])
+            source_node = rvc.addSourceVerbose([file_path])
         except Exception as exc:
             print(f"[KitsuReview] Skipped adding source to RV session: {exc}")
+            source_node = None
+
+        if source_node and openrv_annotations:
+            group_name = rvc.nodeGroup(source_node)
+            paint_node_name = f"{group_name}_paint"
+            print("paint node:", paint_node_name, "exists:", paint_node_name in rvc.nodesOfType("RVPaint"))
+            self.apply_annotations_live(paint_node_name, openrv_annotations)
 
         self.export_btn.setEnabled(True)
 
@@ -491,6 +578,19 @@ class KitsuReviewPanel(QtWidgets.QWidget):
             return rvc.getStringProperty(prop)
         else:
             return None
+
+
+    # known vector-valued properties -> number of components per vector
+    _GROUPED_KEYS = {
+        "points": 2,       # (x, y)
+        "color": 4,        # (r, g, b, a) - may be int or float
+        "innerColor": 4,
+        "borderColor": 4,
+        "startPos": 2,
+        "endPos": 2,
+        "min": 2,
+        "max": 2,
+    }
 
     def _gather_rv_annotations(self):
         annotations = []
@@ -529,18 +629,21 @@ class KitsuReviewPanel(QtWidgets.QWidget):
                     item_prefix = f"{node}.{item_name}."
 
                     properties = {}
-
-                    _PAIRWISE_KEYS = {"points"}
-
                     for p in all_props:
-                        if p.startswith(item_prefix):
-                            attr = p[len(item_prefix):]
-                            value = self._get_rv_property_value(p)
-                            if attr in _PAIRWISE_KEYS and isinstance(value, list) and len(value) % 2 == 0:
-                                value = list(zip(value[0::2], value[1::2]))
-                            properties[attr] = value
+                        if not p.startswith(item_prefix):
+                            continue
+                        attr = p[len(item_prefix):]
+                        value = self._get_rv_property_value(p)
 
-                    print(properties)
+                        group_size = self._GROUPED_KEYS.get(attr)
+                        if group_size and isinstance(value, list) and len(value) % group_size == 0 and len(value) > 0:
+                            # flat [a0,b0,c0,...,a1,b1,c1,...] -> [[a0,b0,c0,...], [a1,b1,c1,...], ...]
+                            value = [list(value[i:i + group_size]) for i in range(0, len(value), group_size)]
+                        elif isinstance(value, list) and len(value) == 1:
+                            # unwrap true scalars (debug, join, cap, startFrame, uuid, brush, borderWidth, ...)
+                            value = value[0]
+
+                        properties[attr] = value
 
                     annotations.append({
                         "frame": frame,
@@ -551,7 +654,22 @@ class KitsuReviewPanel(QtWidgets.QWidget):
                     })
 
         annotations.sort(key=lambda a: a["frame"])
+
         return annotations
+
+    def _push_to_kitsu(
+        self,
+        preview_file,
+        additions,
+        updates,
+        deletions,
+    ):
+        return gazu.files.update_preview_annotations(
+            preview_file,
+            additions=additions,
+            updates=updates,
+            deletions=deletions,
+        )
 
     def _on_add_comment_clicked(self):
         """Post a real comment to Kitsu for the selected revision's task,
@@ -603,6 +721,7 @@ class KitsuReviewPanel(QtWidgets.QWidget):
         if not self.current_revision:
             return
         rev = self.current_revision
+
         task = rev["task"]
 
         try:
@@ -613,25 +732,24 @@ class KitsuReviewPanel(QtWidgets.QWidget):
 
         annotations = self._gather_rv_annotations()
         annotated_frames = sorted({a["frame"] for a in annotations})
-
+        # print(annotations)
         if annotated_frames:
             frames_note = f"{len(annotated_frames)} annotated frame(s): {annotated_frames}"
         else:
             frames_note = "0 annotated frames"
 
-        # print(annotations)
-        print(annotations)
-
         records = convert_openrv_annotations(
             annotations,
-            width=1920,
-            height=1080,
+            width=rev['preview_file']['width'],
+            height=rev['preview_file']['height'],
             fps=24.0,
-            author="5e0ecd69-1559-41a3-b4da-dc1c9d1e0b5c",
+            author=rev['preview_file']['person_id'],
         )
 
-        # print(json.dumps(records, indent=2))
+        # print(records)
 
+        self._push_to_kitsu(rev['preview_file']['id'], records, [], [])
+        print("ok")
         QtWidgets.QMessageBox.information(
             self, "Kitsu",
             "Export complete!\n\n"
