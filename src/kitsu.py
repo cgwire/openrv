@@ -1282,52 +1282,51 @@ class KitsuReviewPanel(_QWidgetBase):
             rvc.setStringProperty(full_name, values, True)
 
     def apply_annotations_live(self, paint_node, openrv_annotations):
-        # ensure the "paint" bookkeeping component exists
+        """openrv_annotations: flat list of shapes as returned by
+        convert_kitsu_annotations(), i.e. [{"type", "frame", "properties"}, ...] --
+        NOT the {"frame", "pens", "texts"} grouping build_paint_gto() uses."""
         self._set_prop(f"{paint_node}.paint.show", rvc.IntType, 1, [1])
 
         next_id = 0
-        frame_order = {}
+        frame_order: Dict[int, List[str]] = {}
 
-        for frame_data in openrv_annotations:
-            frame = int(frame_data["frame"])
+        for shape in openrv_annotations:
+            if shape.get("type") != "pen":
+                # "line"/"ellipse" have no live-property group wired up yet.
+                print(f"[KitsuReview] Live-apply: skipping unsupported shape "
+                    f"type {shape.get('type')!r}", file=sys.stderr)
+                continue
 
-            for pen in frame_data.get("pens", []):
-                cname = f"pen:{next_id}:{frame}:Kitsu"
-                base = f"{paint_node}.{cname}"
-                points = pen["points"]              # list of (x, y) in NDC
-                width = pen.get("width", 0.003)
-                width_list = width if isinstance(width, list) else [width] * len(points)
+            frame = int(shape["frame"])
+            props = shape["properties"]
+            points = props["points"]
 
-                self._set_prop(f"{base}.color", rvc.FloatType, 4, list(pen["color"]))
-                self._set_prop(f"{base}.width", rvc.FloatType, 1, width_list)
-                self._set_prop(f"{base}.brush", rvc.StringType, 1, [pen.get("brush", "circle")])
-                self._set_prop(f"{base}.points", rvc.FloatType, 2,
-                        [c for xy in points for c in xy])   # flatten
-                self._set_prop(f"{base}.debug", rvc.IntType, 1, [0])
-                self._set_prop(f"{base}.join", rvc.IntType, 1, [3])
-                self._set_prop(f"{base}.cap", rvc.IntType, 1, [1])
-                self._set_prop(f"{base}.splat", rvc.IntType, 1, [0])
+            color = props.get("color") or [255, 255, 255, 255]
+            if isinstance(color[0], (list, tuple)):     # tolerate nested [[r,g,b,a]] too
+                color = color[0]
+            color_float = [c / 255.0 for c in color]     # RV wants 0..1 floats here
 
-                frame_order.setdefault(frame, []).append(cname)
-                next_id += 1
+            width = props.get("width", [0.003])
+            if not isinstance(width, list):
+                width = [width]
+            if len(width) != len(points):
+                width = [width[0]] * len(points)
 
-            for txt in frame_data.get("texts", []):
-                cname = f"text:{next_id}:{frame}:Kitsu"
-                base = f"{paint_node}.{cname}"
+            cname = f"pen:{next_id}:{frame}:Kitsu"
+            base = f"{paint_node}.{cname}"
 
-                self._set_prop(f"{base}.position", rvc.FloatType, 2, list(txt["position"]))
-                self._set_prop(f"{base}.color", rvc.FloatType, 4, list(txt.get("color", (1, 1, 1, 1))))
-                self._set_prop(f"{base}.spacing", rvc.FloatType, 1, [txt.get("spacing", 0.8)])
-                self._set_prop(f"{base}.size", rvc.FloatType, 1, [txt.get("size", 0.05)])
-                self._set_prop(f"{base}.scale", rvc.FloatType, 1, [txt.get("scale", 1)])
-                self._set_prop(f"{base}.rotation", rvc.FloatType, 1, [txt.get("rotation", 0)])
-                self._set_prop(f"{base}.font", rvc.StringType, 1, [""])
-                self._set_prop(f"{base}.text", rvc.StringType, 1, [txt["text"]])
-                self._set_prop(f"{base}.origin", rvc.StringType, 1, [""])
-                self._set_prop(f"{base}.debug", rvc.IntType, 1, [0])
+            self._set_prop(f"{base}.color", rvc.FloatType, 4, color_float)
+            self._set_prop(f"{base}.width", rvc.FloatType, 1, width)
+            self._set_prop(f"{base}.brush", rvc.StringType, 1, ["circle"])
+            self._set_prop(f"{base}.points", rvc.FloatType, 2,
+                    [c for xy in points for c in xy])
+            self._set_prop(f"{base}.debug", rvc.IntType, 1, [0])
+            self._set_prop(f"{base}.join", rvc.IntType, 1, [3])
+            self._set_prop(f"{base}.cap", rvc.IntType, 1, [1])
+            self._set_prop(f"{base}.splat", rvc.IntType, 1, [0])
 
-                frame_order.setdefault(frame, []).append(cname)
-                next_id += 1
+            frame_order.setdefault(frame, []).append(cname)
+            next_id += 1
 
         for frame, names in frame_order.items():
             self._set_prop(f"{paint_node}.frame:{frame}.order", rvc.StringType, 1, names)

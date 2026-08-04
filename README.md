@@ -17,4 +17,6 @@ OPENRV_PATH/_build/stage/app/bin/rvpkg -install $HOME/.rv/Packages/kitsu-1.0.rvp
 
 ## TODO
 
-- bug fix: incorrect parsing - some properties are parsed as arrays instead of scalars
+- display thumbnails
+- handle shape annotations
+- handle eraser
