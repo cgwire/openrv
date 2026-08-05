@@ -118,7 +118,8 @@ Point = Tuple[float, float]
 # the "OpenRV plugin" section (the conversion helpers and the CLI at the
 # bottom of this file) stays importable and testable without either.
 try:
-    from PySide6 import QtCore, QtWidgets
+    from PySide6 import QtCore, QtGui, QtWidgets
+    import requests
     import rv
     import rv.rvtypes
     import rv.commands as rvc
@@ -945,6 +946,18 @@ def _person_display_name(person):
     return full or person.get("email", "Unknown")
 
 
+def _thumbnail_url(preview_file_id):
+    """Best-effort Kitsu thumbnail URL for a preview file.
+
+    Thumbnails are served from Kitsu's picture routes, which live at the
+    server root rather than under "/api" (unlike the rest of the gazu
+    API), so the "/api" suffix on the configured host has to be
+    stripped first.
+    """
+    host = gazu.client.get_host()
+    return f"{host}/pictures/originals/preview-files/{preview_file_id}.png"
+
+
 class KitsuReviewPanel(_QWidgetBase):
     """Main widget for the Kitsu Review plugin.
 
@@ -953,6 +966,8 @@ class KitsuReviewPanel(_QWidgetBase):
     window.
     """
 
+    THUMBNAIL_SIZE = (96, 54)  # roughly 16:9, matches typical shot plates
+
     def __init__(self, parent=None):
         super().__init__(parent)
 
@@ -960,6 +975,7 @@ class KitsuReviewPanel(_QWidgetBase):
         self.current_user = None
         self.current_revision = None
         self.revisions = []
+        self._thumbnail_cache: Dict[str, Any] = {}
 
         self._build_ui()
         self._refresh_login_state()
@@ -1000,8 +1016,10 @@ class KitsuReviewPanel(_QWidgetBase):
         left_layout = QtWidgets.QVBoxLayout(left)
         left_layout.addWidget(QtWidgets.QLabel("Revisions available for review"))
 
-        self.table = QtWidgets.QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Shot", "Task", "Rev", "Status", "Date"])
+        self.table = QtWidgets.QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(
+            ["Thumbnail", "Shot", "Task", "Rev", "Status", "Date"]
+        )
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
@@ -1079,6 +1097,7 @@ class KitsuReviewPanel(_QWidgetBase):
         if not connected:
             self.revisions = []
             self.table.setRowCount(0)
+            self._thumbnail_cache.clear()
             self._clear_detail_panel()
 
     def _on_login_clicked(self):
@@ -1138,6 +1157,52 @@ class KitsuReviewPanel(_QWidgetBase):
         )
         self._on_refresh_clicked()
 
+    def _fetch_thumbnail_pixmap(self, preview_file_id):
+        """Fetch (and cache) the QPixmap for a preview file's thumbnail.
+
+        Kitsu's thumbnail route needs the same auth as the rest of the
+        API, so this goes through `requests` directly with gazu's own
+        auth header rather than e.g. Qt's network stack, which wouldn't
+        carry the session token. Returns None (and caches that) if the
+        thumbnail can't be fetched -- a preview with no rendered
+        thumbnail yet is an expected, non-fatal case.
+        """
+        if not preview_file_id:
+            return None
+        if preview_file_id in self._thumbnail_cache:
+            return self._thumbnail_cache[preview_file_id]
+
+        pixmap = None
+        try:
+            url = _thumbnail_url(preview_file_id)
+            headers = gazu.client.make_auth_header()
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.ok:
+                image = QtGui.QImage()
+                if image.loadFromData(response.content):
+                    pixmap = QtGui.QPixmap.fromImage(image)
+        except Exception as exc:
+            print(f"[KitsuReview] Could not fetch thumbnail for preview "
+                  f"{preview_file_id}: {exc}")
+
+        self._thumbnail_cache[preview_file_id] = pixmap
+        return pixmap
+
+    def _make_thumbnail_widget(self, preview_file_id):
+        label = QtWidgets.QLabel()
+        label.setAlignment(QtCore.Qt.AlignCenter)
+
+        pixmap = self._fetch_thumbnail_pixmap(preview_file_id)
+        if pixmap and not pixmap.isNull():
+            tw, th = self.THUMBNAIL_SIZE
+            label.setPixmap(
+                pixmap.scaled(tw, th, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+            )
+        else:
+            label.setText("(no thumbnail)")
+            label.setStyleSheet("color: #888; font-style: italic;")
+        return label
+
     def _on_refresh_clicked(self):
         """Pull the current user's real tasks from Kitsu and list any
         revisions (preview files) available to review for each one."""
@@ -1175,6 +1240,10 @@ class KitsuReviewPanel(_QWidgetBase):
 
             latest_preview = max(previews, key=_preview_revision)
 
+            print('---')
+            print(task)
+            print(entity)
+
             revisions.append({
                 "task": task,
                 "entity": entity,
@@ -1189,21 +1258,29 @@ class KitsuReviewPanel(_QWidgetBase):
                 "date": _format_date(latest_preview.get("created_at") or task.get("updated_at")),
             })
 
-        QtWidgets.QApplication.restoreOverrideCursor()
-
         self.revisions = revisions
 
         self.table.setRowCount(0)
         for row, rev in enumerate(self.revisions):
             self.table.insertRow(row)
+            self.table.setRowHeight(row, self.THUMBNAIL_SIZE[1] + 10)
+
+            thumb_widget = self._make_thumbnail_widget(rev["preview_file"].get("id"))
+            self.table.setCellWidget(row, 0, thumb_widget)
+
             values = [
                 rev["shot"], rev["task_type"], f"v{rev['revision']:03d}",
                 rev["status"], rev["date"],
             ]
-            for col, value in enumerate(values):
+            for offset, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(str(value))
-                self.table.setItem(row, col, item)
+                self.table.setItem(row, offset + 1, item)
+
+        QtWidgets.QApplication.restoreOverrideCursor()
+
+        self.table.setColumnWidth(0, self.THUMBNAIL_SIZE[0] + 8)
         self.table.resizeColumnsToContents()
+        self.table.setColumnWidth(0, self.THUMBNAIL_SIZE[0] + 8)
         self._clear_detail_panel()
 
         if not self.revisions:
