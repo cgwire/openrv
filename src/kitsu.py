@@ -28,11 +28,11 @@ artist:
     5. Post review comments back to Kitsu
     6. Export annotations + a comment-count summary back to Kitsu
 
-Outside OpenRV, the conversion functions (`convert_openrv_annotations`,
+The conversion functions (`convert_openrv_annotations`,
 `convert_kitsu_annotations`, `build_paint_gto`) are plain, dependency-
-free functions you can import and test on their own -- see "Running
-standalone" below. PySide6 / rv / gazu are only imported by the plugin
-classes, and only if they're actually available.
+free functions used internally by the plugin. PySide6 / rv / gazu are
+only imported by the plugin classes, and only if they're actually
+available.
 
 --------------------------------------------------------------------------
 Coordinate systems
@@ -141,20 +141,10 @@ Round-tripping notes
   top-left of the whole box. `TEXT_BASELINE_RATIO` is the one knob that
   reconciles them, and it is applied symmetrically so text round-trips
   to the same place it started.
-
---------------------------------------------------------------------------
-Running standalone
---------------------------------------------------------------------------
-    python3 kitsu.py annotations.json --width 1920 --height 1080
-
-reads a JSON file of Kitsu per-frame annotation records and prints the
-equivalent OpenRV paint shapes. This works without OpenRV, PySide6, or
-gazu installed -- see "OpenRV-only dependencies" below.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import sys
@@ -172,8 +162,8 @@ Point = Tuple[float, float]
 # `rv` / `rv.commands` / `rv.qtutils` only exist inside OpenRV's embedded
 # Python interpreter, and `gazu` requires `pip install gazu` in that same
 # environment. They're imported once, defensively, so that everything above
-# the "OpenRV plugin" section (the conversion helpers and the CLI at the
-# bottom of this file) stays importable and testable without either.
+# the "OpenRV plugin" section (the conversion helpers) stays importable and
+# testable without either.
 try:
     from PySide6 import QtCore, QtGui, QtWidgets
     import requests
@@ -1209,7 +1199,7 @@ def convert_openrv_annotations(
     author = author or str(uuid.uuid4())
     canvas_width = float(canvas_width or width)
     canvas_height = float(canvas_height or height)
-
+    print(openrv_shapes)
     # group OpenRV shapes by (converted) frame number, preserving order
     by_frame: Dict[int, List[Dict[str, Any]]] = {}
     for shape in openrv_shapes:
@@ -1652,7 +1642,7 @@ def convert_kitsu_annotations(
     default_canvas_height = float(canvas_height or height)
 
     shapes: List[Dict[str, Any]] = []
-
+    print(kitsu_records)
     for record in kitsu_records or []:
         try:
             frame_num = int(record["frame"]) - frame_offset
@@ -2940,57 +2930,3 @@ def createMode():
             "(PySide6 + rv + gazu); this module was imported standalone."
         )
     return KitsuReviewMode()
-
-
-# ============================================================================
-# 6. Standalone CLI: Kitsu annotation JSON -> OpenRV shapes
-# ============================================================================
-
-def _main() -> None:
-    """CLI entry point: convert a Kitsu preview-annotation JSON dump into
-    OpenRV paint shapes. Only exercises `convert_kitsu_annotations`, so it
-    works without OpenRV, PySide6, or gazu installed."""
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Convert Kitsu preview-annotation JSON into OpenRV paint shapes."
-    )
-    parser.add_argument("kitsu_json", help="Path to a JSON file containing the Kitsu annotation records list")
-    parser.add_argument("--width", type=int, required=True, help="Source video/image width in px")
-    parser.add_argument("--height", type=int, required=True, help="Source video/image height in px")
-    parser.add_argument("--canvas-width", type=float, default=None, help="Fabric.js canvas width, if different from --width")
-    parser.add_argument("--canvas-height", type=float, default=None, help="Fabric.js canvas height, if different from --height")
-    parser.add_argument("--frame-offset", type=int, default=0, help="Subtracted from each Kitsu frame number")
-    parser.add_argument("-o", "--output", default=None, help="Where to write the OpenRV shapes JSON (default: stdout)")
-    args = parser.parse_args()
-
-    with open(args.kitsu_json) as f:
-        records = json.load(f)
-
-    canvas_width, canvas_height = args.canvas_width, args.canvas_height
-    if canvas_width is None or canvas_height is None:
-        # Same recovery the plugin does: the objects' own canvasWidth/Height
-        # is the only reliable record of the canvas Kitsu drew on.
-        inferred_w, inferred_h = _infer_canvas_size(records, args.width, args.height)
-        canvas_width = canvas_width if canvas_width is not None else inferred_w
-        canvas_height = canvas_height if canvas_height is not None else inferred_h
-
-    shapes = convert_kitsu_annotations(
-        records,
-        width=args.width,
-        height=args.height,
-        canvas_width=canvas_width,
-        canvas_height=canvas_height,
-        frame_offset=args.frame_offset,
-    )
-
-    output = json.dumps(shapes, indent=2)
-    if args.output:
-        with open(args.output, "w") as f:
-            f.write(output)
-    else:
-        print(output)
-
-
-if __name__ == "__main__":
-    _main()
