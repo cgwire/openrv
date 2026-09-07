@@ -1,1 +1,1 @@
-zip -r kitsu-1.0.rvpkg ./src/PACKAGE ./src/kitsu.py ./src/utils.py ./src/zou.py ./src/session.py ./src/rvpaint.py
+zip -r kitsu-1.0.rvpkg ./src/PACKAGE ./src/kitsu.py
