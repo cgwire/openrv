@@ -1,99 +1,4 @@
 #!/usr/bin/env python3
-"""
-Kitsu <-> OpenRV review bridge
-==============================
-
-Single-file combination of what used to be four separate modules:
-
-    * map_annotations.py    -- OpenRV paint shapes  --> Kitsu Fabric.js JSON
-    * kitsu_to_openrv.py    -- Kitsu Fabric.js JSON  --> OpenRV paint shapes
-    * openrv_paint_gto.py   -- OpenRV paint shapes   --> RVPaint ".gto" text
-    * kitsu.py              -- the OpenRV "Kitsu Review" dock-panel plugin
-
-They're kept together because the plugin (`KitsuReviewPanel`, at the
-bottom of this file) is the only real consumer of the conversion
-helpers, and previously had to import across three sibling modules that
-only ever made sense as a set.
-
---------------------------------------------------------------------------
-What this file does
---------------------------------------------------------------------------
-Inside OpenRV, `createMode()` docks a "Kitsu Review" panel that lets an
-artist:
-
-    1. Log in to Kitsu (real gazu login)
-    2. Browse their assigned tasks and pick a revision (preview file)
-    3. Download that revision and load it into the RV session
-    4. Annotate the frame using RV's own Paint tools
-    5. Post review comments back to Kitsu
-    6. Export annotations + a comment-count summary back to Kitsu
-
-Outside OpenRV, the conversion functions (`convert_openrv_annotations`,
-`convert_kitsu_annotations`, `build_paint_gto`) are plain, dependency-
-free functions you can import and test on their own -- see "Running
-standalone" below. PySide6 / rv / gazu are only imported by the plugin
-classes, and only if they're actually available.
-
---------------------------------------------------------------------------
-Coordinate systems
---------------------------------------------------------------------------
-OpenRV paint annotations store points in RV's normalized "paint" space:
-
-    * origin (0, 0) is the CENTER of the image
-    * Y is UP, spans roughly [-1, 1] for the full frame height
-    * X is scaled by the image aspect ratio, spans [-aspect, aspect]
-      where aspect = width / height
-
-Kitsu/Fabric.js works in plain PIXEL space relative to the annotation
-canvas:
-
-    * origin (0, 0) is the TOP-LEFT corner
-    * X grows right, Y grows DOWN
-    * "canvasWidth" / "canvasHeight" define the pixel space that points
-      and left/top/width/height are expressed in (this can differ
-      slightly from the actual video resolution)
-
-    OpenRV -> Kitsu:  px = (nx / aspect + 1) / 2 * canvas_width
-                      py = (1 - ny) / 2 * canvas_height
-    Kitsu -> OpenRV:  nx = aspect * (2 * px / canvas_width - 1)
-                      ny = 1 - 2 * py / canvas_height
-
---------------------------------------------------------------------------
-Round-tripping notes
---------------------------------------------------------------------------
-* Pure Fabric.js/CSS boilerplate (angle, flipX/Y, skewX/Y, scaleX/Y,
-  version, shadow, erasable, fillRule, paintFirst, strokeLineCap/Join,
-  strokeUniform, strokeDashArray/Offset, strokeMiterLimit,
-  globalCompositeOperation, backgroundColor, ...) has no OpenRV
-  equivalent in either direction and is simply discarded.
-* "startTime"/"endTime" on a PSStroke are wall-clock telemetry of when
-  the artist drew it -- cosmetic, not structural. Going OpenRV->Kitsu we
-  synthesize monotonically increasing values; going Kitsu->OpenRV we
-  drop them.
-* "createdBy" (a Kitsu person id) has no OpenRV field. Going
-  OpenRV->Kitsu every shape gets the same `author`; going Kitsu->OpenRV
-  it's dropped from the shape but still available via `extract_authors`.
-* Fabric's "id" round-trips as OpenRV's "uuid" property, so shape
-  identity survives a full OpenRV -> Kitsu -> OpenRV trip.
-* Kitsu color arrays ("color"/"borderColor"/"innerColor") are
-  [r, g, b, a] with each channel an INTEGER 0..255 (confirmed against
-  real RV round-tripping); RV's own color rows are FLOATS 0..1.
-* Only "PSStroke" (freehand pen) has a confirmed real Kitsu sample.
-  "line" and "ellipse" are mapped onto Fabric.js's native "line" /
-  "ellipse" object types -- if your Kitsu deployment uses custom
-  "PSLine" / "PSEllipse" subclasses instead, the `_line_*` /
-  `_ellipse_*` converters below are intentionally isolated so you can
-  adjust them without touching anything else.
-
---------------------------------------------------------------------------
-Running standalone
---------------------------------------------------------------------------
-    python3 kitsu.py annotations.json --width 1920 --height 1080
-
-reads a JSON file of Kitsu per-frame annotation records and prints the
-equivalent OpenRV paint shapes. This works without OpenRV, PySide6, or
-gazu installed -- see "OpenRV-only dependencies" below.
-"""
 
 from __future__ import annotations
 
@@ -109,14 +14,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 Point = Tuple[float, float]
 
 
-# ----------------------------------------------------------------------------
-# OpenRV-only dependencies
-# ----------------------------------------------------------------------------
-# `rv` / `rv.commands` / `rv.qtutils` only exist inside OpenRV's embedded
-# Python interpreter, and `gazu` requires `pip install gazu` in that same
-# environment. They're imported once, defensively, so that everything above
-# the "OpenRV plugin" section (the conversion helpers and the CLI at the
-# bottom of this file) stays importable and testable without either.
 try:
     from PySide6 import QtCore, QtGui, QtWidgets
     import requests
@@ -131,31 +28,23 @@ except ImportError:
     _INSIDE_OPENRV = False
 
 
-# ----------------------------------------------------------------------------
-# Shared constants
-# ----------------------------------------------------------------------------
+MS_PER_STROKE_POINT = 8
 
-MS_PER_STROKE_POINT = 8  # rough authoring-speed estimate for PSStroke startTime/endTime
-
-# Where downloaded preview files are written before being loaded into RV.
 DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "kitsu_review_downloads")
 
 _FRAME_ORDER_RE = re.compile(r"\bframe:(\d+)\b.*\.order$")
 
 _HEX_COLOR_RE = re.compile(r"^#?[0-9a-fA-F]{6}$")
 
-# Fabric.js/CSS spellings that mean "no color here" rather than an actual
-# hex value. Kitsu (and hand-edited/older annotation data) can hand back
-# any of these for "stroke" or "fill" instead of a real "#rrggbb" string.
+_RESOLUTION_RE = re.compile(r"^\s*(\d+)\s*[xX*]\s*(\d+)\s*$")
+
 _NO_COLOR_VALUES = {"none", "null", "transparent", ""}
 
+_STILL_EXTENSIONS = {
+    "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff",
+    "exr", "dpx", "tga", "webp",
+}
 
-# ============================================================================
-# 1. Coordinate & color conversion
-# ============================================================================
-# `rv_normalized_to_pixel` / `pixel_to_rv_normalized` and their color
-# counterparts below are exact inverses of each other, so they're kept side
-# by side here instead of split across two files.
 
 def rv_normalized_to_pixel(
     nx: float, ny: float, width: int, height: int,
@@ -257,51 +146,8 @@ def color_to_rv_color(value: Any, opacity: float = 1.0) -> List[List[int]]:
     return [255, 255, 255, fallback_alpha]
 
 
-# kept as an alias -- some callers/older code may still import this name
 hex_to_rv_color = color_to_rv_color
 
-
-# ============================================================================
-# 2. OpenRV -> Kitsu  (paint shapes -> Fabric.js annotation records)
-# ============================================================================
-# Kitsu's annotation tool is built on Fabric.js. Annotations for a preview
-# file are stored as a list of *per-frame* records:
-#
-#     [
-#       {
-#         "time": 0,          # this frame's offset into the timeline, in ms
-#         "frame": 1,
-#         "drawing": {
-#           "objects": [ <fabric-style object>, <fabric-style object>, ... ]
-#         }
-#       },
-#       ...
-#     ]
-#
-# Each object inside "drawing.objects" is a serialized Fabric.js object.
-# For freehand pen strokes Kitsu uses a custom subclass called "PSStroke"
-# (Paint-Stroke), e.g.:
-#
-#     {
-#       "id": "...", "type": "PSStroke",
-#       "left": <bbox left px>, "top": <bbox top px>,
-#       "width": <bbox width px>, "height": <bbox height px>,
-#       "stroke": "#ff3860", "strokeWidth": 20, "opacity": 1,
-#       "canvasWidth": 1697.77, "canvasHeight": 955,
-#       "strokePoints": [{"x":.., "y":.., "type":"PSPoint", "pressure":1}, ...],
-#       "createdBy": "<user id>",
-#       "startTime": <ms>, "endTime": <ms>,
-#       ... (Fabric.js boilerplate -- see the module docstring)
-#     }
-#
-# Only "PSStroke" has a confirmed real sample; "line" and "ellipse" below
-# are mapped onto Fabric.js's own native object types of the same name.
-#
-# "time" (per frame record) is meaningful -- Kitsu uses it to scrub/seek:
-# (frame - frame_base) / fps * 1000. "startTime"/"endTime" (per PSStroke)
-# are cosmetic wall-clock telemetry; since OpenRV doesn't record them, we
-# synthesize monotonically increasing values rather than inventing fake
-# "real" timestamps.
 
 def _fabric_base(
     obj_type: str,
@@ -375,7 +221,7 @@ def _pen_to_fabric(
     start_time = clock_ms[0]
     duration = max(1, len(points_px) * MS_PER_STROKE_POINT)
     end_time = start_time + duration
-    clock_ms[0] = end_time  # advance the shared clock so strokes don't overlap
+    clock_ms[0] = end_time
 
     obj = _fabric_base(
         "PSStroke", left, top, bbox_w, bbox_h,
@@ -398,10 +244,6 @@ def _line_to_fabric(
     canvas_width: float, canvas_height: float,
     author: str, clock_ms: List[int],
 ) -> Dict[str, Any]:
-    # NOTE: no confirmed Kitsu sample for lines. Mapped onto Fabric.js's
-    # native "line" object type (x1/y1/x2/y2 + the same stroke styling
-    # PSStroke uses). Adjust here if your Kitsu build uses a custom
-    # "PSLine" type instead.
     props = shape["properties"]
     (sx, sy), (ex, ey) = props["startPos"][0], props["endPos"][0]
     x1, y1 = rv_normalized_to_pixel(sx, sy, width, height, canvas_width, canvas_height)
@@ -433,10 +275,6 @@ def _ellipse_to_fabric(
     canvas_width: float, canvas_height: float,
     author: str, clock_ms: List[int],
 ) -> Dict[str, Any]:
-    # NOTE: no confirmed Kitsu sample for ellipses either. Mapped onto
-    # Fabric.js's native "ellipse" object type (rx/ry + left/top/width/
-    # height bbox). Adjust here if your Kitsu build uses a custom
-    # "PSEllipse" type instead.
     props = shape["properties"]
     (minx, miny) = props["min"][0]
     (maxx, maxy) = props["max"][0]
@@ -482,12 +320,13 @@ def _infer_canvas_size(
     see the module docstring). Falls back to (fallback_width,
     fallback_height) only if no existing object carries the field, e.g. a
     preview with no annotations yet."""
-    for record in kitsu_records:
+    for record in kitsu_records or []:
         for obj in record.get("drawing", {}).get("objects", []):
             cw, ch = obj.get("canvasWidth"), obj.get("canvasHeight")
             if cw and ch:
                 return float(cw), float(ch)
     return float(fallback_width), float(fallback_height)
+
 
 _SHAPE_CONVERTERS = {
     "pen": _pen_to_fabric,
@@ -508,42 +347,10 @@ def convert_openrv_annotations(
     frame_base: int = 1,
     skip_soft_deleted: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Convert raw OpenRV annotation shapes into a list of Kitsu per-frame
-    annotation records, ready for the ``additions`` argument of
-    ``gazu.files.update_preview_annotations``.
-
-    Args:
-        openrv_shapes: parsed OpenRV/RV paint-annotation shapes (e.g. the
-            result of ``json.load()`` on an RV annotation export).
-        width: source video/image width in pixels (defines the aspect
-            ratio RV normalized its coordinates against).
-        height: source video/image height in pixels.
-        fps: playback fps, used to compute the "time" field.
-        author: Kitsu person ID to record as "createdBy" on each stroke.
-            Defaults to a freshly generated UUID if not provided.
-        canvas_width: Kitsu annotation canvas width, if different from
-            `width`. Defaults to `width`.
-        canvas_height: Kitsu annotation canvas height, if different from
-            `height`. Defaults to `height`.
-        frame_offset: added to every OpenRV frame number before
-            grouping/sending (use if RV frame numbering != Kitsu frame
-            numbering).
-        frame_base: the OpenRV frame number that corresponds to Kitsu
-            "time": 0 (i.e. the first frame of the shot/clip on Kitsu's
-            timeline).
-        skip_soft_deleted: if True (default), shapes with
-            softDeleted=1 are dropped; pass False to keep them.
-    """
     author = author or str(uuid.uuid4())
     canvas_width = canvas_width or float(width)
     canvas_height = canvas_height or float(height)
 
-    print(canvas_width)
-    print(canvas_height)
-    print(width)
-    print(height)
-
-    # group OpenRV shapes by (converted) frame number, preserving order
     by_frame: Dict[int, List[Dict[str, Any]]] = {}
     for shape in openrv_shapes:
         if skip_soft_deleted and shape.get("properties", {}).get("softDeleted"):
@@ -551,7 +358,7 @@ def convert_openrv_annotations(
         frame_num = shape["frame"] + frame_offset
         by_frame.setdefault(frame_num, []).append(shape)
 
-    clock_ms = [int(_time.time() * 1000)]  # mutable shared "wall clock"
+    clock_ms = [int(_time.time() * 1000)]
     records: List[Dict[str, Any]] = []
 
     for frame_num in sorted(by_frame):
@@ -583,19 +390,6 @@ def convert_openrv_annotations(
     return records
 
 
-# ============================================================================
-# 3. Kitsu -> OpenRV  (Fabric.js annotation records -> paint shapes)
-# ============================================================================
-# This is a best-effort inverse of section 2. A few notes specific to this
-# direction (see the module docstring's "Round-tripping notes" for the
-# shared ones):
-#
-# * The ellipse's "min"/"max" bookkeeping only ever stored an axis-aligned
-#   bounding box in OpenRV, so reconstructing it from the Fabric bbox
-#   (left/top/width/height) round-trips exactly -- there's no information
-#   about which literal corner was "min" vs "max" to lose in the first
-#   place.
-
 def _pen_from_fabric(
     obj: Dict[str, Any], width: int, height: int,
     canvas_width: float, canvas_height: float, frame_num: int,
@@ -625,9 +419,6 @@ def _line_from_fabric(
     obj: Dict[str, Any], width: int, height: int,
     canvas_width: float, canvas_height: float, frame_num: int,
 ) -> Dict[str, Any]:
-    # NOTE: mirrors _line_to_fabric -- assumes the native Fabric.js "line"
-    # type (x1/y1/x2/y2). If your Kitsu deployment emits a custom
-    # "PSLine" subclass instead, adjust the field lookups here.
     x1, y1 = obj.get("x1", obj["left"]), obj.get("y1", obj["top"])
     x2, y2 = obj.get("x2", obj["left"] + obj["width"]), obj.get("y2", obj["top"] + obj["height"])
 
@@ -654,9 +445,6 @@ def _ellipse_from_fabric(
     obj: Dict[str, Any], width: int, height: int,
     canvas_width: float, canvas_height: float, frame_num: int,
 ) -> Dict[str, Any]:
-    # NOTE: mirrors _ellipse_to_fabric -- assumes the native Fabric.js
-    # "ellipse" type (left/top/width/height bbox). Adjust here if your
-    # Kitsu deployment uses a custom "PSEllipse" subclass instead.
     left, top = obj["left"], obj["top"]
     bbox_w, bbox_h = obj["width"], obj["height"]
 
@@ -700,41 +488,17 @@ def convert_kitsu_annotations(
     canvas_width: Optional[float] = None,
     canvas_height: Optional[float] = None,
     frame_offset: int = 0,
+    default_frame: int = 1,
 ) -> List[Dict[str, Any]]:
-    """Convert Kitsu per-frame preview annotation records back into a
-    flat list of OpenRV/RV paint-annotation shapes.
 
-    Args:
-        kitsu_records: the list of ``{"time", "frame", "drawing":
-            {"objects": [...]}}`` records, e.g. as returned by
-            ``gazu.files.get_preview_file_annotations`` or read back
-            from a preview file's annotations field.
-        width: source video/image width in pixels (the aspect ratio RV
-            normalizes coordinates against). Should match whatever was
-            passed to ``convert_openrv_annotations`` originally.
-        height: source video/image height in pixels.
-        canvas_width: the Fabric.js annotation canvas width the
-            records' pixel coordinates are expressed in. Defaults to
-            `width` (pass the actual value if it differs, e.g. Kitsu's
-            own canvasWidth on the objects, which takes precedence
-            per-object when present).
-        canvas_height: same as `canvas_width`, for height.
-        frame_offset: subtracted from each Kitsu "frame" number to
-            recover the original OpenRV frame numbering (inverse of the
-            `frame_offset` passed to ``convert_openrv_annotations``).
-
-    Returns:
-        A flat list of OpenRV shape dicts (``{"type", "frame",
-        "properties"}``), sorted by frame then by original object order
-        within each frame.
-    """
     default_canvas_width = canvas_width or float(width)
     default_canvas_height = canvas_height or float(height)
 
     shapes: List[Dict[str, Any]] = []
 
-    for record in kitsu_records:
-        frame_num = record["frame"] - frame_offset
+    for record in kitsu_records or []:
+        raw_frame = record.get("frame")
+        frame_num = (default_frame if raw_frame is None else int(raw_frame)) - frame_offset
         objects = record.get("drawing", {}).get("objects", [])
 
         for obj in objects:
@@ -748,8 +512,6 @@ def convert_kitsu_annotations(
                 )
                 continue
 
-            # per-object canvas size takes precedence if Kitsu recorded
-            # one (it can differ slightly from the nominal video res).
             obj_canvas_width = obj.get("canvasWidth", default_canvas_width)
             obj_canvas_height = obj.get("canvasHeight", default_canvas_height)
 
@@ -766,21 +528,12 @@ def extract_authors(kitsu_records: Sequence[Dict[str, Any]]) -> Dict[str, str]:
     through. Useful if the caller wants to preserve authorship
     out-of-band alongside ``convert_kitsu_annotations``'s output."""
     authors: Dict[str, str] = {}
-    for record in kitsu_records:
+    for record in kitsu_records or []:
         for obj in record.get("drawing", {}).get("objects", []):
             if obj.get("id") and obj.get("createdBy"):
                 authors[obj["id"]] = obj["createdBy"]
     return authors
 
-
-# ============================================================================
-# 4. OpenRV RVPaint GTO serialization
-# ============================================================================
-# Serializes converted Kitsu annotations (the same {"frame", "pens",
-# "texts"} structure `KitsuReviewPanel.apply_annotations_live` below
-# consumes) into a standalone RVPaint GTO text fragment -- an alternative
-# to poking RV's live property API when you just want the .gto text (e.g.
-# to write directly into a session file).
 
 def _fnum(n: float) -> str:
     if n == int(n):
@@ -798,8 +551,8 @@ def _nested(pairs: Sequence[Point]) -> str:
 
 def _pen_block(pen: Dict[str, Any], pen_id: int, frame: int) -> Tuple[str, str]:
     name = f'"pen:{pen_id}:{frame}:Kitsu"'
-    color = pen["color"]              # (r, g, b, a)
-    width = pen["width"]              # list, one per point (or a single float)
+    color = pen["color"]
+    width = pen["width"]
     if isinstance(width, (int, float)):
         width = [width] * len(pen["points"])
 
@@ -888,35 +641,6 @@ def build_paint_gto(paint_node_name: str, openrv_annotations: List[Dict[str, Any
     return "\n".join(lines)
 
 
-# ============================================================================
-# 5. OpenRV plugin: "Kitsu Review" dock panel
-# ============================================================================
-# Login, task listing, preview downloading, and comments use the real
-# Kitsu Python SDK (`gazu`):
-#   - gazu.log_in / gazu.log_out                          -- authentication
-#   - gazu.task.all_tasks_for_person(person)               -- tasks assigned to the user
-#   - gazu.entity.get_entity(entity_id)                    -- shot/asset info for a task
-#   - gazu.files.get_all_preview_files_for_task(task)      -- revisions (preview files) for a task
-#   - gazu.files.download_preview_file(preview_file, path) -- actual media download
-#   - gazu.task.all_comments_for_task(task)                -- comment history for a task
-#   - gazu.task.get_task_status(task_status_id)            -- resolve a task's current status
-#   - gazu.task.add_comment(task, task_status, comment=...) -- post a new comment
-#
-# Annotation export (the "Annotations exported" part of `_on_export_clicked`)
-# is still simulated -- the RV-side node parsing in `_gather_rv_annotations`
-# uses the real RV command API where possible, but the exact per-frame paint
-# property paths can vary between RV versions/builds -- double check those
-# against the RV build you are targeting before shipping. Only the comment
-# count in the export summary is backed by real data; comments themselves
-# are posted to Kitsu immediately when added (`_on_add_comment_clicked`)
-# rather than being batched up for export.
-#
-# Make sure `gazu` is installed in RV's Python environment: pip install gazu
-
-# Base classes fall back to `object` when PySide6/rv aren't available, so
-# these classes stay *importable* (e.g. for tooling or static analysis)
-# even outside OpenRV. Actually instantiating them still requires the real
-# environment -- see `createMode` at the end of this section.
 _QWidgetBase = QtWidgets.QWidget if _INSIDE_OPENRV else object
 _MinorModeBase = rv.rvtypes.MinorMode if _INSIDE_OPENRV else object
 
@@ -958,6 +682,54 @@ def _thumbnail_url(preview_file_id):
     return f"{host}/pictures/originals/preview-files/{preview_file_id}.png"
 
 
+def _is_still(preview_file):
+    """True if this preview is a single picture rather than a movie.
+
+    Kitsu records "extension" without a leading dot.
+    """
+    return str(preview_file.get("extension") or "").lower().lstrip(".") in _STILL_EXTENSIONS
+
+
+def _dimensions_from_file(file_path):
+    """Read pixel dimensions off a downloaded file, or None if that isn't
+    possible (unsupported/unreadable format, or running outside OpenRV
+    where Qt's image loaders aren't available)."""
+    if not _INSIDE_OPENRV or not file_path or not os.path.exists(file_path):
+        return None
+    image = QtGui.QImage(file_path)
+    if image.isNull() or image.width() <= 0 or image.height() <= 0:
+        return None
+    return image.width(), image.height()
+
+
+def _preview_dimensions(preview_file, entity=None, file_path=None):
+
+    width, height = preview_file.get("width"), preview_file.get("height")
+    if width and height:
+        return int(width), int(height)
+
+    resolution = ((entity or {}).get("data") or {}).get("resolution") or ""
+    match = _RESOLUTION_RE.match(str(resolution))
+    if match:
+        return int(match.group(1)), int(match.group(2))
+
+    from_file = _dimensions_from_file(file_path)
+    if from_file:
+        return from_file
+
+    for record in preview_file.get("annotations") or []:
+        for obj in record.get("drawing", {}).get("objects", []):
+            canvas_w, canvas_h = obj.get("canvasWidth"), obj.get("canvasHeight")
+            if canvas_w and canvas_h:
+                return int(round(float(canvas_w))), int(round(float(canvas_h)))
+
+    raise ValueError(
+        f"Could not determine the pixel dimensions of preview file "
+        f"{preview_file.get('id')!r} (extension "
+        f"{preview_file.get('extension')!r})."
+    )
+
+
 class KitsuReviewPanel(_QWidgetBase):
     """Main widget for the Kitsu Review plugin.
 
@@ -966,7 +738,7 @@ class KitsuReviewPanel(_QWidgetBase):
     window.
     """
 
-    THUMBNAIL_SIZE = (96, 54)  # roughly 16:9, matches typical shot plates
+    THUMBNAIL_SIZE = (96, 54)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1102,7 +874,6 @@ class KitsuReviewPanel(_QWidgetBase):
 
     def _on_login_clicked(self):
         if self.logged_in:
-            # --- Logout ---
             try:
                 gazu.log_out()
             except Exception as exc:
@@ -1123,7 +894,6 @@ class KitsuReviewPanel(_QWidgetBase):
             )
             return
 
-        # Real Kitsu login via gazu.
         self.login_btn.setEnabled(False)
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
@@ -1141,9 +911,6 @@ class KitsuReviewPanel(_QWidgetBase):
         QtWidgets.QApplication.restoreOverrideCursor()
         self.login_btn.setEnabled(True)
 
-        # gazu.log_in() typically returns {"user": {...}, "ldap": bool} -- but
-        # be defensive in case the SDK version in use returns the user dict
-        # directly.
         if isinstance(user, dict) and "user" in user:
             self.current_user = user["user"]
         else:
@@ -1234,15 +1001,9 @@ class KitsuReviewPanel(_QWidgetBase):
                 previews = []
 
             if not previews:
-                # Nothing has been published for this task yet -- skip it,
-                # there's no revision to review.
                 continue
 
             latest_preview = max(previews, key=_preview_revision)
-
-            print('---')
-            print(task)
-            print(entity)
 
             revisions.append({
                 "task": task,
@@ -1256,6 +1017,9 @@ class KitsuReviewPanel(_QWidgetBase):
                 ),
                 "artist": self._display_name(),
                 "date": _format_date(latest_preview.get("created_at") or task.get("updated_at")),
+                "width": None,
+                "height": None,
+                "base_frame": 1,
             })
 
         self.revisions = revisions
@@ -1340,8 +1104,6 @@ class KitsuReviewPanel(_QWidgetBase):
             return
         QtWidgets.QApplication.restoreOverrideCursor()
 
-        # Kitsu typically returns comments newest-first; show oldest-first
-        # so the conversation reads top to bottom.
         for comment in reversed(comments):
             author = _person_display_name(comment.get("person"))
             date = _format_date(comment.get("created_at"))
@@ -1369,7 +1131,6 @@ class KitsuReviewPanel(_QWidgetBase):
 
         for shape in openrv_annotations:
             if shape.get("type") != "pen":
-                # "line"/"ellipse" have no live-property group wired up yet.
                 print(f"[KitsuReview] Live-apply: skipping unsupported shape "
                     f"type {shape.get('type')!r}", file=sys.stderr)
                 continue
@@ -1379,9 +1140,9 @@ class KitsuReviewPanel(_QWidgetBase):
             points = props["points"]
 
             color = props.get("color") or [255, 255, 255, 255]
-            if isinstance(color[0], (list, tuple)):     # tolerate nested [[r,g,b,a]] too
+            if isinstance(color[0], (list, tuple)):
                 color = color[0]
-            color_float = [c / 255.0 for c in color]     # RV wants 0..1 floats here
+            color_float = [c / 255.0 for c in color]
 
             width = props.get("width", [0.003])
             if not isinstance(width, list):
@@ -1410,25 +1171,29 @@ class KitsuReviewPanel(_QWidgetBase):
 
         rvc.redraw()
 
+    def _source_start_frame(self, source_node, default=1):
+        """First frame of a source in the current session. A still image
+        occupies exactly one frame, which is where Kitsu's frameless
+        annotations have to land."""
+        try:
+            info = rvc.nodeRangeInfo(source_node) or {}
+        except Exception as exc:
+            print(f"[KitsuReview] Could not query frame range for {source_node}: {exc}")
+            return default
+        start = info.get("start") if isinstance(info, dict) else None
+        try:
+            return int(start)
+        except (TypeError, ValueError):
+            return default
+
     def _on_download_clicked(self):
         """Download the selected revision's preview file from Kitsu and
-        load it into the current RV session."""
+        load it into the current RV session, then re-apply any annotations
+        Kitsu already has for it."""
         if not self.current_revision:
             return
         rev = self.current_revision
         preview_file = rev["preview_file"]
-        kitsu_annotations = preview_file["annotations"]
-
-        openrv_annotations = convert_kitsu_annotations(
-            kitsu_annotations,
-            width=rev["preview_file"]["width"],
-            height=rev["preview_file"]["height"],
-            canvas_width=None,
-            canvas_height=None,
-            frame_offset=0,
-        )
-
-        # print(openrv_annotations)
 
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
         original_name = preview_file.get("original_name") or preview_file.get("id", "revision")
@@ -1446,8 +1211,6 @@ class KitsuReviewPanel(_QWidgetBase):
         QtWidgets.QApplication.processEvents()
 
         def _progress_callback(size, total_size):
-            # gazu reports raw byte counts for the transfer; guard against
-            # an unknown/zero total.
             pct = int(min(100, max(0, (size / total_size) * 100))) if total_size else 0
             progress.setValue(pct)
             QtWidgets.QApplication.processEvents()
@@ -1457,8 +1220,6 @@ class KitsuReviewPanel(_QWidgetBase):
                 preview_file, file_path, progress_callback=_progress_callback
             )
         except TypeError:
-            # Some gazu versions don't accept progress_callback -- fall
-            # back to a plain download.
             try:
                 gazu.files.download_preview_file(preview_file, file_path)
             except Exception as exc:
@@ -1479,10 +1240,40 @@ class KitsuReviewPanel(_QWidgetBase):
             print(f"[KitsuReview] Skipped adding source to RV session: {exc}")
             source_node = None
 
+        is_still = _is_still(preview_file)
+        base_frame = self._source_start_frame(source_node) if (source_node and is_still) else 1
+        rev["base_frame"] = base_frame
+
+        try:
+            width, height = _preview_dimensions(preview_file, rev.get("entity"), file_path)
+        except ValueError as exc:
+            rev["width"] = rev["height"] = None
+            openrv_annotations = []
+            print(f"[KitsuReview] {exc} Existing annotations will not be loaded.")
+            QtWidgets.QMessageBox.warning(
+                self, "Kitsu",
+                "Could not determine this preview's pixel dimensions, so its "
+                "existing annotations were skipped.\n\nThe media itself has "
+                "still been loaded into RV."
+            )
+        else:
+            rev["width"], rev["height"] = width, height
+            openrv_annotations = convert_kitsu_annotations(
+                preview_file.get("annotations") or [],
+                width=width,
+                height=height,
+                canvas_width=None,
+                canvas_height=None,
+                frame_offset=0,
+                default_frame=base_frame,
+            )
+            if is_still:
+                for shape in openrv_annotations:
+                    shape["frame"] = base_frame
+
         if source_node and openrv_annotations:
             group_name = rvc.nodeGroup(source_node)
             paint_node_name = f"{group_name}_paint"
-            # print("paint node:", paint_node_name, "exists:", paint_node_name in rvc.nodesOfType("RVPaint"))
             self.apply_annotations_live(paint_node_name, openrv_annotations)
 
         self.export_btn.setEnabled(True)
@@ -1511,10 +1302,9 @@ class KitsuReviewPanel(_QWidgetBase):
         else:
             return None
 
-    # known vector-valued properties -> number of components per vector
     _GROUPED_KEYS = {
-        "points": 2,       # (x, y)
-        "color": 4,        # (r, g, b, a) - may be int or float
+        "points": 2,
+        "color": 4,
         "innerColor": 4,
         "borderColor": 4,
         "startPos": 2,
@@ -1553,7 +1343,7 @@ class KitsuReviewPanel(_QWidgetBase):
                 if isinstance(order, str):
                     order = [order]
                 if not order:
-                    continue  # empty -> no strokes/text on this frame
+                    continue
 
                 for item_name in order:
                     kind = item_name.split(":")[0] if ":" in item_name else item_name
@@ -1568,10 +1358,8 @@ class KitsuReviewPanel(_QWidgetBase):
 
                         group_size = self._GROUPED_KEYS.get(attr)
                         if group_size and isinstance(value, list) and len(value) % group_size == 0 and len(value) > 0:
-                            # flat [a0,b0,c0,...,a1,b1,c1,...] -> [[a0,b0,c0,...], [a1,b1,c1,...], ...]
                             value = [list(value[i:i + group_size]) for i in range(0, len(value), group_size)]
                         elif isinstance(value, list) and len(value) == 1:
-                            # unwrap true scalars (debug, join, cap, startFrame, uuid, brush, borderWidth, ...)
                             value = value[0]
 
                         properties[attr] = value
@@ -1614,9 +1402,6 @@ class KitsuReviewPanel(_QWidgetBase):
         self.add_comment_btn.setEnabled(False)
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            # Resolve the full task-status object so we can pass it back in
-            # unchanged -- add_comment() requires a status even when the
-            # comment shouldn't change it.
             task_status = gazu.task.get_task_status(status_id)
             gazu.task.add_comment(
                 task,
@@ -1634,20 +1419,14 @@ class KitsuReviewPanel(_QWidgetBase):
         self.add_comment_btn.setEnabled(True)
         self.comment_input.clear()
 
-        # Reload from Kitsu so the list reflects exactly what's stored there.
         self._reload_comments()
 
     def _on_export_clicked(self):
-        # NOTE: comments are now posted to Kitsu immediately (see
-        # _on_add_comment_clicked), so this just reports what's already
-        # there. Annotation export is still simulated -- swap for a real
-        # gazu call (e.g. attaching frame data via a preview/attachment
-        # endpoint) when ready.
         if not self.current_revision:
             return
         rev = self.current_revision
-
         task = rev["task"]
+        preview_file = rev["preview_file"]
 
         try:
             n_comments = len(gazu.task.all_comments_for_task(task) or [])
@@ -1662,23 +1441,44 @@ class KitsuReviewPanel(_QWidgetBase):
         else:
             frames_note = "0 annotated frames"
 
+        width, height = rev.get("width"), rev.get("height")
+        if not (width and height):
+            try:
+                width, height = _preview_dimensions(preview_file, rev.get("entity"))
+            except ValueError as exc:
+                QtWidgets.QMessageBox.critical(
+                    self, "Kitsu",
+                    f"Cannot export annotations: {exc}\n\n"
+                    "Download the revision first so its size can be read from "
+                    "the file."
+                )
+                return
+            rev["width"], rev["height"] = width, height
+
         canvas_width, canvas_height = _infer_canvas_size(
-            rev["preview_file"].get("annotations") or [],
-            rev["preview_file"]["width"],
-            rev["preview_file"]["height"],
+            preview_file.get("annotations"), width, height,
         )
+
+        base_frame = rev.get("base_frame") or 1
+        if _is_still(preview_file) and annotated_frames:
+            base_frame = annotated_frames[0]
 
         records = convert_openrv_annotations(
             annotations,
-            width=rev["preview_file"]["width"],
-            height=rev["preview_file"]["height"],
+            width=width,
+            height=height,
             fps=24.0,
-            author=rev["preview_file"]["person_id"],
+            author=preview_file.get("person_id"),
             canvas_width=canvas_width,
             canvas_height=canvas_height,
+            frame_base=base_frame,
         )
 
-        self._push_to_kitsu(rev["preview_file"]["id"], records, [], [])
+        try:
+            self._push_to_kitsu(preview_file["id"], records, [], [])
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Kitsu", f"Annotation export failed: {exc}")
+            return
 
         QtWidgets.QMessageBox.information(
             self, "Kitsu",
@@ -1687,9 +1487,7 @@ class KitsuReviewPanel(_QWidgetBase):
             f"Task: {rev['task_type']}\n"
             f"Revision: v{rev['revision']:03d}\n"
             f"Comments on Kitsu: {n_comments}\n"
-            f"Annotations exported: {frames_note}\n\n"
-            "(Comments are real and already on Kitsu. Annotation export is still "
-            "mock data -- no annotation request was actually sent to Kitsu.)"
+            f"Annotations exported: {frames_note}"
         )
 
 
@@ -1742,10 +1540,6 @@ def createMode():
     return KitsuReviewMode()
 
 
-# ============================================================================
-# 6. Standalone CLI: Kitsu annotation JSON -> OpenRV shapes
-# ============================================================================
-
 def _main() -> None:
     """CLI entry point: convert a Kitsu preview-annotation JSON dump into
     OpenRV paint shapes. Only exercises `convert_kitsu_annotations`, so it
@@ -1761,6 +1555,7 @@ def _main() -> None:
     parser.add_argument("--canvas-width", type=float, default=None, help="Fabric.js canvas width, if different from --width")
     parser.add_argument("--canvas-height", type=float, default=None, help="Fabric.js canvas height, if different from --height")
     parser.add_argument("--frame-offset", type=int, default=0, help="Subtracted from each Kitsu frame number")
+    parser.add_argument("--default-frame", type=int, default=1, help="Frame to use for records with no frame field (still previews)")
     parser.add_argument("-o", "--output", default=None, help="Where to write the OpenRV shapes JSON (default: stdout)")
     args = parser.parse_args()
 
@@ -1774,6 +1569,7 @@ def _main() -> None:
         canvas_width=args.canvas_width,
         canvas_height=args.canvas_height,
         frame_offset=args.frame_offset,
+        default_frame=args.default_frame,
     )
 
     output = json.dumps(shapes, indent=2)
