@@ -1,6 +1,6 @@
-package: My Plugin
-author: Your Name
-version: 1.0
+package: Kitsu
+author: CGWire
+version: 0.1
 
 modes:
   - file: kitsu.py

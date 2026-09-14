@@ -1,2 +1,5 @@
 kitsu-1.0.rvpkg
 tmp*
+reinstall.sh
+package.sh
+src/__pycache__/

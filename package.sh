@@ -1,1 +1,0 @@
-zip -r kitsu-1.0.rvpkg ./src/PACKAGE ./src/kitsu.py

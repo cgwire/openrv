@@ -1,0 +1,40 @@
+name: Build rvpkg
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from PACKAGE
+        id: vars
+        run: |
+          version=$(awk -F':[[:space:]]*' '/^version:/ {gsub(/["\r[:space:]]/, "", $2); print $2; exit}' src/PACKAGE)
+          if [ -z "$version" ]; then
+            echo "::error file=src/PACKAGE::no version field found"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building version $version"
+
+      - name: Build package
+        run: zip -r kitsu-${{ steps.vars.outputs.version }}.rvpkg ./src/PACKAGE ./src/kitsu.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kitsu-rvpkg
+          path: '*.rvpkg'
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: '*.rvpkg'
