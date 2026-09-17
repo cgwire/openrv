@@ -30,7 +30,13 @@ except ImportError:
 
 MS_PER_STROKE_POINT = 8
 
-DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "kitsu_review_downloads")
+# Both overridable from the environment so a studio launcher can point every
+# seat at its own Kitsu and a fast local scratch disk without editing the package.
+DOWNLOAD_DIR = os.environ.get("KITSU_OPENRV_DOWNLOAD_DIR") or os.path.join(
+    os.path.expanduser("~"), "kitsu_review_downloads"
+)
+DEFAULT_HOST = os.environ.get("KITSU_HOST", "http://localhost/api")
+DEFAULT_LOGIN = os.environ.get("KITSU_LOGIN", "")
 
 _FRAME_ORDER_RE = re.compile(r"\bframe:(\d+)\b.*\.order$")
 
@@ -381,9 +387,15 @@ def convert_openrv_annotations(
         if not objects:
             continue
 
+        # Kitsu's player matches an annotation to the playhead by comparing
+        # `time` in SECONDS with the video's currentTime (within half a
+        # frame, see kitsu src/lib/players/annotation.js findAnnotationAtTime),
+        # and stores `frame` as the 0-based frame index it derived from that
+        # time. Milliseconds here would never match.
+        video_frame = frame_num - frame_base
         records.append({
-            "time": round((frame_num - frame_base) / fps * 1000),
-            "frame": frame_num,
+            "time": video_frame / fps,
+            "frame": video_frame,
             "drawing": {"objects": objects},
         })
 
@@ -489,6 +501,7 @@ def convert_kitsu_annotations(
     canvas_height: Optional[float] = None,
     frame_offset: int = 0,
     default_frame: int = 1,
+    fps: float = 24.0,
 ) -> List[Dict[str, Any]]:
 
     default_canvas_width = canvas_width or float(width)
@@ -498,6 +511,9 @@ def convert_kitsu_annotations(
 
     for record in kitsu_records or []:
         raw_frame = record.get("frame")
+        if raw_frame is None and record.get("time") is not None:
+            # Older Kitsu records only carry `time` (seconds).
+            raw_frame = int(round(float(record["time"]) * fps))
         frame_num = (default_frame if raw_frame is None else int(raw_frame)) - frame_offset
         objects = record.get("drawing", {}).get("objects", [])
 
@@ -761,9 +777,9 @@ class KitsuReviewPanel(_QWidgetBase):
         top_bar.addWidget(self.status_label)
         top_bar.addStretch()
 
-        self.server_field = QtWidgets.QLineEdit("http://localhost/api")
+        self.server_field = QtWidgets.QLineEdit(DEFAULT_HOST)
         self.server_field.setFixedWidth(260)
-        self.user_field = QtWidgets.QLineEdit("admin@example.com")
+        self.user_field = QtWidgets.QLineEdit(DEFAULT_LOGIN)
         self.user_field.setPlaceholderText("email")
         self.pass_field = QtWidgets.QLineEdit()
         self.pass_field.setPlaceholderText("password")
@@ -1264,8 +1280,10 @@ class KitsuReviewPanel(_QWidgetBase):
                 height=height,
                 canvas_width=None,
                 canvas_height=None,
-                frame_offset=0,
-                default_frame=base_frame,
+                # Kitsu's `frame` is the 0-based video frame index; RV's
+                # source frames start at base_frame.
+                frame_offset=-base_frame,
+                default_frame=0,
             )
             if is_still:
                 for shape in openrv_annotations:
