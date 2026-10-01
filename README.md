@@ -17,8 +17,9 @@ Limitations:
 
 ## Installation
 
-1. Download the latest package from the Github repository: [Releases](https://github.com/cgwire/openrv/releases)
-2. Install the package in `OpenRV > Preferences > Packages > Add Packages`
+1. Make sure you have `gazu` installed: `pip install gazu requests`
+2. Download the latest package from the Github repository: [Releases](https://github.com/cgwire/openrv/releases)
+3. Install the package in `OpenRV > Preferences > Packages > Add Packages`
 
 ## Development
 
