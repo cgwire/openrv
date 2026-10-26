@@ -3,3 +3,9 @@ tmp*
 reinstall.sh
 package.sh
 src/__pycache__/
+KITSU_PREVIEW.json
+KITSU.json
+ORV.json
+orv_video.json
+test_image.json
+test_video.json
