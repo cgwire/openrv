@@ -6,9 +6,9 @@ This OpenRV package integrates [CGWire's Kitsu](https://www.cg-wire.com/) in you
 
 Features:
 
-- Kitsu login
-- Load WFA shots
-- Read / send comments
+- Persistent Kitsu login
+- Load WFA shots from your pending playlists or "My Checks" page
+- Read / send comments along with status changes
 - Pen annotations
 
 Limitations:
@@ -17,7 +17,7 @@ Limitations:
 
 ## Installation
 
-1. Make sure you have `gazu` installed: `pip install gazu requests`
+1. Make sure you have `gazu` and `keyring` installed: `pip install gazu requests keyring`
 2. Download the latest package from the Github repository: [Releases](https://github.com/cgwire/openrv/releases)
 3. Install the package in `OpenRV > Preferences > Packages > Add Packages`
 
@@ -26,7 +26,7 @@ Limitations:
 1. Package the plugin for OpenRV:
 
 ```bash
-zip -r kitsu.rvpkg ./src/PACKAGE ./src/kitsu.py
+zip -r kitsu-1.0.rvpkg ./src/PACKAGE ./src/kitsu.py ./src/annotation_converter.py
 ```
 
 2. Install the package in `OpenRV > Preferences > Packages > Add Packages` or use the OpenRV CLI:
