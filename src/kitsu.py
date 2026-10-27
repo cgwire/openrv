@@ -318,8 +318,9 @@ class KitsuReviewPanel(_QWidgetBase):
         self.dev_scope_check.setChecked(True)
         self.dev_scope_check.setToolTip(
             "Only show annotations from the paint node(s) of the source(s) "
-            "under the playhead. Uncheck to include every paint node in the "
-            "session -- which is what Export to Kitsu sends."
+            "under the playhead, including the sequence-level ones RV draws "
+            "into. Uncheck to show exactly what Export to Kitsu reads: every "
+            "paint node drawing on the selected revision's source."
         )
         self.dev_scope_check.toggled.connect(lambda _c: self._refresh_dev_view())
         controls.addWidget(self.dev_scope_check)

@@ -17,7 +17,9 @@ import sys
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
-from annotation_converter import DEFAULT_FPS, convertToKitsu, convertToORV
+from annotation_converter import (
+    DEFAULT_FPS, convertToKitsu, convertToORV, split_annotation_changes,
+)
 
 try:
     from PySide6 import QtCore, QtGui
@@ -458,12 +460,58 @@ class RvSession:
             return default
 
     @staticmethod
-    def current_source_paint_nodes():
+    def paint_nodes_for_source(source_group):
+        """Every RVPaint node that draws on one source, upstream first.
+
+        That's the paint node inside the source's own group, then the
+        per-input paint nodes RV puts in each sequence/retime/switch group
+        that source feeds ("<group>_p_<sourceGroup>"). RV's annotate mode
+        draws on the first paint node it finds from the view down, so in
+        a sequence view, strokes made in RV land in "defaultSequence_p_..."
+        rather than in the source's own paint node. Those per-input nodes
+        sit before the retime, so their frames are source frames too.
+
+        RV renders every paint node's strokes into one list, upstream node
+        first, so an eraser in a downstream node erases strokes from the
+        source's node. Reading the nodes in this order keeps that true.
+        """
+        try:
+            all_paint = list(rvc.nodesOfType("RVPaint") or [])
+        except Exception as exc:
+            print(f"[KitsuReview] Could not query paint nodes: {exc}")
+            return []
+
+        own, downstream = [], []
+        suffix = f"_p_{source_group}"
+        for node in all_paint:
+            try:
+                group = rvc.nodeGroup(node)
+            except Exception:
+                group = None
+            if group == source_group:
+                own.append(node)
+            elif node.endswith(suffix):
+                downstream.append(node)
+        return own + sorted(downstream)
+
+    @staticmethod
+    def _pipeline_order(paint_nodes):
+        """Paint nodes with those inside source groups first: they're
+        upstream of any view-level paint node, so RV draws their strokes
+        first (see `paint_nodes_for_source`)."""
+        def is_view_level(node):
+            try:
+                return rvc.nodeType(rvc.nodeGroup(node)) != "RVSourceGroup"
+            except Exception:
+                return True
+        return sorted(paint_nodes, key=is_view_level)
+
+    def current_source_paint_nodes(self):
         """(sources, paint_nodes) for the source(s) under the playhead.
 
         In a stack/layout view several sources can be visible at once, so
-        all of them are returned. Paint nodes are found by type within each
-        source's group rather than by name, so renamed groups still work.
+        all of them are returned, with every paint node that draws on each
+        (see `paint_nodes_for_source`).
         """
         try:
             sources = list(rvc.sourcesAtFrame(rvc.frame()) or [])
@@ -475,16 +523,12 @@ class RvSession:
         for source in sources:
             try:
                 group = rvc.nodeGroup(source)
-                members = rvc.nodesInGroup(group) or []
             except Exception as exc:
                 print(f"[KitsuReview] Could not inspect group of {source}: {exc}")
                 continue
-            for node in members:
-                try:
-                    if rvc.nodeType(node) == "RVPaint" and node not in paint_nodes:
-                        paint_nodes.append(node)
-                except Exception:
-                    continue
+            for node in self.paint_nodes_for_source(group):
+                if node not in paint_nodes:
+                    paint_nodes.append(node)
         return sources, paint_nodes
 
     @staticmethod
@@ -498,6 +542,126 @@ class RvSession:
         elif ptype == rvc.StringType:
             rvc.setStringProperty(full_name, values, True)
 
+    @staticmethod
+    def _color_float(color, default=(255, 255, 255, 255)):
+        """A convertToORV color (flat [r, g, b, a], 0..255) as the 0..1
+        floats RV paint properties hold."""
+        color = color or list(default)
+        if isinstance(color[0], (list, tuple)):
+            color = color[0]
+        return [c / 255.0 for c in color]
+
+    def _write_pen(self, base, frame, props):
+        points = props["points"]
+
+        width = props.get("width", [0.003])
+        if not isinstance(width, list):
+            width = [width]
+        if len(width) != len(points):
+            width = [width[0]] * len(points)
+
+        self._set_prop(f"{base}.color", rvc.FloatType, 4, self._color_float(props.get("color")))
+        self._set_prop(f"{base}.width", rvc.FloatType, 1, width)
+        self._set_prop(f"{base}.brush", rvc.StringType, 1, ["circle"])
+        self._set_prop(f"{base}.points", rvc.FloatType, 2,
+                       [c for xy in points for c in xy])
+        self._set_prop(f"{base}.debug", rvc.IntType, 1, [0])
+        self._set_prop(f"{base}.join", rvc.IntType, 1, [3])
+        self._set_prop(f"{base}.cap", rvc.IntType, 1, [1])
+        self._set_prop(f"{base}.splat", rvc.IntType, 1, [0])
+        # 0 paints, 1 erases what's drawn before it (Kitsu erasers).
+        self._set_prop(f"{base}.mode", rvc.IntType, 1, [int(props.get("mode") or 0)])
+        if props.get("uuid"):
+            self._set_prop(f"{base}.uuid", rvc.StringType, 1, [str(props["uuid"])])
+
+    def _write_box(self, base, frame, props):
+        """The same properties RV writes for an ellipse or rect drawn with
+        its own annotate tools (see a gathered RV shape in the Dev tab);
+        the two share one property set and differ only in the component
+        name's "ellipse:"/"rect:" prefix."""
+        self._set_prop(f"{base}.startFrame", rvc.IntType, 1, [int(props.get("startFrame", frame))])
+        self._set_prop(f"{base}.duration", rvc.IntType, 1, [int(props.get("duration", 1))])
+        self._set_prop(f"{base}.eye", rvc.IntType, 1, [int(props.get("eye", 2))])
+        self._set_prop(f"{base}.min", rvc.FloatType, 2, [float(v) for v in props["min"][0]])
+        self._set_prop(f"{base}.max", rvc.FloatType, 2, [float(v) for v in props["max"][0]])
+        self._set_prop(f"{base}.innerColor", rvc.FloatType, 4,
+                       self._color_float(props.get("innerColor"), default=(255, 255, 255, 0)))
+        self._set_prop(f"{base}.borderColor", rvc.FloatType, 4,
+                       self._color_float(props.get("borderColor")))
+        self._set_prop(f"{base}.borderWidth", rvc.FloatType, 1,
+                       [float(props.get("borderWidth", 0.003))])
+        if props.get("uuid"):
+            self._set_prop(f"{base}.uuid", rvc.StringType, 1, [str(props["uuid"])])
+        self._set_prop(f"{base}.softDeleted", rvc.IntType, 1, [int(props.get("softDeleted", 0))])
+
+    def _write_arrow(self, base, frame, props):
+        """The same properties RV writes for an arrow drawn with its own
+        annotate tool: tail at startPos, head at endPos, the line width as
+        both thickness and borderWidth, the color in borderColor and
+        innerColor."""
+        border = self._color_float(props.get("borderColor"))
+        inner = self._color_float(props["innerColor"]) if props.get("innerColor") else border
+        thickness = float(props.get("thickness", props.get("borderWidth", 0.003)))
+
+        self._set_prop(f"{base}.startFrame", rvc.IntType, 1, [int(props.get("startFrame", frame))])
+        self._set_prop(f"{base}.duration", rvc.IntType, 1, [int(props.get("duration", 1))])
+        self._set_prop(f"{base}.eye", rvc.IntType, 1, [int(props.get("eye", 2))])
+        self._set_prop(f"{base}.startPos", rvc.FloatType, 2, [float(v) for v in props["startPos"][0]])
+        self._set_prop(f"{base}.endPos", rvc.FloatType, 2, [float(v) for v in props["endPos"][0]])
+        self._set_prop(f"{base}.borderColor", rvc.FloatType, 4, border)
+        self._set_prop(f"{base}.borderWidth", rvc.FloatType, 1,
+                       [float(props.get("borderWidth", thickness))])
+        self._set_prop(f"{base}.innerColor", rvc.FloatType, 4, inner)
+        self._set_prop(f"{base}.thickness", rvc.FloatType, 1, [thickness])
+        if props.get("uuid"):
+            self._set_prop(f"{base}.uuid", rvc.StringType, 1, [str(props["uuid"])])
+        self._set_prop(f"{base}.softDeleted", rvc.IntType, 1, [int(props.get("softDeleted", 0))])
+
+    def _write_text(self, base, frame, props):
+        """The same properties RV writes for text placed with its own
+        annotate tool: position is the left end of the first baseline,
+        fontSize the text height as a fraction of the image height, and
+        size the legacy equivalent older RV builds read (fontSize / 12.5
+        at scale 1)."""
+        position = props["position"]
+        if isinstance(position[0], (list, tuple)):
+            position = position[0]
+        scale = float(props.get("scale", 1.0)) or 1.0
+        font_size = float(props.get("fontSize", 0.05))
+        size = float(props.get("size", font_size / scale / 12.5))
+
+        self._set_prop(f"{base}.position", rvc.FloatType, 2, [float(v) for v in position[:2]])
+        self._set_prop(f"{base}.color", rvc.FloatType, 4, self._color_float(props.get("color")))
+        self._set_prop(f"{base}.spacing", rvc.FloatType, 1, [float(props.get("spacing", 0.8))])
+        self._set_prop(f"{base}.size", rvc.FloatType, 1, [size])
+        self._set_prop(f"{base}.scale", rvc.FloatType, 1, [scale])
+        self._set_prop(f"{base}.rotation", rvc.FloatType, 1, [float(props.get("rotation", 0.0))])
+        self._set_prop(f"{base}.font", rvc.StringType, 1, [str(props.get("font", ""))])
+        self._set_prop(f"{base}.text", rvc.StringType, 1, [str(props.get("text", ""))])
+        self._set_prop(f"{base}.origin", rvc.StringType, 1, [str(props.get("origin", ""))])
+        self._set_prop(f"{base}.debug", rvc.IntType, 1, [int(props.get("debug", 0))])
+        self._set_prop(f"{base}.startFrame", rvc.IntType, 1, [int(props.get("startFrame", frame))])
+        self._set_prop(f"{base}.duration", rvc.IntType, 1, [int(props.get("duration", 1))])
+        self._set_prop(f"{base}.mode", rvc.IntType, 1, [int(props.get("mode", 0))])
+        self._set_prop(f"{base}.fontFamily", rvc.StringType, 1, [str(props.get("fontFamily", ""))])
+        self._set_prop(f"{base}.fontSize", rvc.FloatType, 1, [font_size])
+        self._set_prop(f"{base}.fontWeight", rvc.StringType, 1, [str(props.get("fontWeight", "normal"))])
+        self._set_prop(f"{base}.fontStyle", rvc.StringType, 1, [str(props.get("fontStyle", "normal"))])
+        self._set_prop(f"{base}.textDecoration", rvc.StringType, 1,
+                       [str(props.get("textDecoration", "none"))])
+        self._set_prop(f"{base}.textAlign", rvc.StringType, 1, [str(props.get("textAlign", "left"))])
+        if props.get("uuid"):
+            self._set_prop(f"{base}.uuid", rvc.StringType, 1, [str(props["uuid"])])
+        self._set_prop(f"{base}.softDeleted", rvc.IntType, 1, [int(props.get("softDeleted", 0))])
+
+    _SHAPE_WRITERS = {
+        "pen": "_write_pen",
+        "ellipse": "_write_box",
+        "rect": "_write_box",
+        "arrow": "_write_arrow",
+        "text": "_write_text",
+    }
+
     def apply_annotations_live(self, paint_node, openrv_annotations):
         """openrv_annotations: flat list of shapes as returned by
         convertToORV(), i.e. [{"type", "frame", "properties"}, ...]."""
@@ -507,38 +671,16 @@ class RvSession:
         frame_order: Dict[int, List[str]] = {}
 
         for shape in openrv_annotations:
-            if shape.get("type") != "pen":
+            kind = shape.get("type")
+            writer = self._SHAPE_WRITERS.get(kind)
+            if writer is None:
                 print(f"[KitsuReview] Live-apply: skipping unsupported shape "
-                      f"type {shape.get('type')!r}", file=sys.stderr)
+                      f"type {kind!r}", file=sys.stderr)
                 continue
 
             frame = int(shape["frame"])
-            props = shape["properties"]
-            points = props["points"]
-
-            color = props.get("color") or [255, 255, 255, 255]
-            if isinstance(color[0], (list, tuple)):
-                color = color[0]
-            color_float = [c / 255.0 for c in color]
-
-            width = props.get("width", [0.003])
-            if not isinstance(width, list):
-                width = [width]
-            if len(width) != len(points):
-                width = [width[0]] * len(points)
-
-            cname = f"pen:{next_id}:{frame}:Kitsu"
-            base = f"{paint_node}.{cname}"
-
-            self._set_prop(f"{base}.color", rvc.FloatType, 4, color_float)
-            self._set_prop(f"{base}.width", rvc.FloatType, 1, width)
-            self._set_prop(f"{base}.brush", rvc.StringType, 1, ["circle"])
-            self._set_prop(f"{base}.points", rvc.FloatType, 2,
-                           [c for xy in points for c in xy])
-            self._set_prop(f"{base}.debug", rvc.IntType, 1, [0])
-            self._set_prop(f"{base}.join", rvc.IntType, 1, [3])
-            self._set_prop(f"{base}.cap", rvc.IntType, 1, [1])
-            self._set_prop(f"{base}.splat", rvc.IntType, 1, [0])
+            cname = f"{kind}:{next_id}:{frame}:Kitsu"
+            getattr(self, writer)(f"{paint_node}.{cname}", frame, shape["properties"])
 
             frame_order.setdefault(frame, []).append(cname)
             next_id += 1
@@ -569,14 +711,19 @@ class RvSession:
     def gather_annotations(self, paint_nodes=None):
         """Read annotation shapes out of RV paint nodes.
 
-        paint_nodes: list of RVPaint node names to read, or None to read
-        every paint node in the session (what Export uses).
+        paint_nodes: list of RVPaint node names to read, upstream first
+        (as `paint_nodes_for_source` returns them), or None to read every
+        paint node in the session.
+
+        Shapes come out per frame in drawing order: the nodes in the order
+        given, each node in its own frame order. The order matters for
+        erasers, which only cut what is drawn before them.
         """
         annotations = []
 
         if paint_nodes is None:
             try:
-                paint_nodes = rvc.nodesOfType("RVPaint")
+                paint_nodes = self._pipeline_order(rvc.nodesOfType("RVPaint") or [])
             except Exception as exc:
                 print(f"[KitsuReview] Could not query paint nodes: {exc}")
                 return annotations
@@ -1363,6 +1510,14 @@ class KitsuReviewModel:
         fps = rev.get("fps") or DEFAULT_FPS
         source_node = self.rv.add_source(file_path)
         self.rv.set_fps(fps, source_node)
+        # Export reads the paint nodes of this source only (see
+        # RvSession.paint_nodes_for_source).
+        rev["source_group"] = None
+        if source_node:
+            try:
+                rev["source_group"] = rvc.nodeGroup(source_node)
+            except Exception as exc:
+                print(f"[KitsuReview] Could not find the group of {source_node}: {exc}")
 
         is_still = _is_still(preview_file)
         base_frame = self.rv.source_start_frame(source_node) if (source_node and is_still) else 1
@@ -1431,6 +1586,15 @@ class KitsuReviewModel:
             reference_records=preview_file.get("annotations"),
         )
 
+    def export_paint_nodes(self, rev):
+        """The paint nodes Export reads for `rev`: the ones drawing on the
+        source it was loaded into, upstream first. None (every paint node
+        in the session, in pipeline order) if that source isn't known."""
+        source_group = rev.get("source_group")
+        if not source_group:
+            return None
+        return self.rv.paint_nodes_for_source(source_group) or None
+
     @staticmethod
     def _push_to_kitsu(preview_file, additions, updates, deletions):
         return gazu.files.update_preview_annotations(
@@ -1442,16 +1606,19 @@ class KitsuReviewModel:
 
     def export_annotations(self, rev, fallback_comment_count=0):
         """Send every paint node's annotations to the revision's preview
-        file on Kitsu. Returns {"n_comments", "frames_note"} for the
-        summary. Raises DimensionsUnknownError if the size is unknown,
-        or the server's error if the push fails."""
+        file on Kitsu: new objects as additions, existing ones that changed
+        (e.g. erased in RV) as updates, since Kitsu ignores an addition
+        whose id it already has. Returns {"n_comments", "frames_note",
+        "n_added", "n_updated"} for the summary. Raises
+        DimensionsUnknownError if the size is unknown, or the server's
+        error if the push fails."""
         try:
             n_comments = len(gazu.task.all_comments_for_task(rev["task"]) or [])
         except Exception as exc:
             print(f"[KitsuReview] Could not fetch comment count for export summary: {exc}")
             n_comments = fallback_comment_count
 
-        annotations = self.rv.gather_annotations()
+        annotations = self.rv.gather_annotations(self.export_paint_nodes(rev))
         annotated_frames = sorted({a["frame"] for a in annotations})
         if annotated_frames:
             frames_note = f"{len(annotated_frames)} annotated frame(s): {annotated_frames}"
@@ -1460,9 +1627,24 @@ class KitsuReviewModel:
 
         self.resolve_dimensions(rev)
         records = self.kitsu_records_for(rev, annotations)
-        self._push_to_kitsu(rev["preview_file"]["id"], records, [], [])
+        preview_file = rev["preview_file"]
+        additions, updates = split_annotation_changes(records, preview_file.get("annotations"))
+        if additions or updates:
+            result = self._push_to_kitsu(preview_file["id"], additions, updates, [])
+            # Match the next export against what Kitsu now stores, not
+            # against what it had when the revision list was loaded.
+            if isinstance(result, dict) and isinstance(result.get("annotations"), list):
+                preview_file["annotations"] = result["annotations"]
 
-        return {"n_comments": n_comments, "frames_note": frames_note}
+        def count(groups):
+            return sum(len(g["drawing"]["objects"]) for g in groups)
+
+        return {
+            "n_comments": n_comments,
+            "frames_note": frames_note,
+            "n_added": count(additions),
+            "n_updated": count(updates),
+        }
 
     # ------------------------------------------------------------------
     # Dev view
@@ -1505,8 +1687,11 @@ class KitsuReviewModel:
             sources, paint_nodes = self.rv.current_source_paint_nodes()
             scope = {"scope": "current source", "sources": sources, "paint_nodes": paint_nodes}
         else:
-            paint_nodes = None
-            scope = {"scope": "all paint nodes"}
+            # What Export reads for the selected revision.
+            rev = self.current_revision
+            paint_nodes = self.export_paint_nodes(rev) if rev else None
+            scope = ({"scope": "export (selected revision's source)", "paint_nodes": paint_nodes}
+                     if paint_nodes else {"scope": "all paint nodes"})
 
         annotations = self.rv.gather_annotations(paint_nodes)
         frames = sorted({a["frame"] for a in annotations})
