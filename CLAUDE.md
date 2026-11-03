@@ -13,17 +13,20 @@ PYENV_VERSION=3.11.14 black -l 79 src test
 python src/annotation_converter.py annotations.json --width 1920 --height 1080 --fps 24 -o shapes.json
 
 # Package locally (install steps are in README.md)
-zip -r kitsu-1.0.rvpkg ./src/PACKAGE ./src/kitsu.py ./src/kitsu_review_model.py ./src/annotation_converter.py
+zip -r kitsu-1.0.rvpkg ./src/PACKAGE ./src/*.py
 ```
 
 ## Architecture
 
-Dependencies go one way: `kitsu.py` → `kitsu_review_model.py` → `annotation_converter.py`.
+Dependencies go one way: `kitsu.py` → `kitsu_review_model.py` → the other modules.
 
 | Module | Role | May import |
 |--------|------|------------|
 | `src/kitsu.py` | Panel widgets, event handlers, the RV `MinorMode` | Qt, rv, the model |
-| `src/kitsu_review_model.py` | gazu calls, session persistence, status rules, RV paint nodes. Creates no widgets | gazu, requests, keyring, rv, the converter |
+| `src/kitsu_review_model.py` | gazu calls, status rules, revision state. Creates no widgets | gazu, requests, rv, the modules below |
+| `src/kitsu_session_store.py` | Saved identity and tokens | QSettings, keyring |
+| `src/kitsu_rv_session.py` | RV sources and paint nodes | rv |
+| `src/kitsu_review_log.py` | Log messages | Nothing |
 | `src/annotation_converter.py` | Pure Kitsu ↔ RV conversion and its CLI | Standard library only |
 
 - Keep the layers: no gazu call in `kitsu.py`, no Qt, rv or gazu in the converter.
@@ -75,7 +78,7 @@ There is no automated suite and no linter in CI.
 
 - `src/PACKAGE` holds the version and the mode list. Bump the version there.
 - Pushing a `v*` tag runs `.github/workflows/package.yml`, which attaches the `.rvpkg` to the GitHub release.
-- **A new module must be added to the zip command in both `README.md` and `package.yml`.**
+- The package holds `src/PACKAGE` and every `src/*.py`, so a new module needs no packaging change.
 
 ## Git & PR
 

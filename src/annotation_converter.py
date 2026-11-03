@@ -32,7 +32,7 @@ import re
 import sys
 import time as _time
 import uuid
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 __all__ = [
     "convertToKitsu",
@@ -145,6 +145,21 @@ def _warn(message: str) -> None:
     print(f"warning: {message}", file=sys.stderr)
 
 
+class _PaintSpace(NamedTuple):
+    """
+    Give the sizes that a conversion between RV and Kitsu coordinates needs.
+
+    `width` and `height` are the media size. `canvas_width` and
+    `canvas_height` are the size of the Fabric.js canvas. The two sizes can
+    be different.
+    """
+
+    width: int
+    height: int
+    canvas_width: float
+    canvas_height: float
+
+
 def _aspect(width: int, height: int) -> float:
     return float(width) / float(height) if width and height else 1.0
 
@@ -152,34 +167,28 @@ def _aspect(width: int, height: int) -> float:
 def rv_normalized_to_pixel(
     nx: float,
     ny: float,
-    width: int,
-    height: int,
-    canvas_width: float,
-    canvas_height: float,
+    space: _PaintSpace,
 ) -> Point:
     """
     OpenRV -> Kitsu: convert a normalized point of RV paint space to Fabric.js
     canvas pixels (origin top-left, y down).
     """
-    px = (nx / _aspect(width, height) + 0.5) * canvas_width
-    py = (0.5 - ny) * canvas_height
+    px = (nx / _aspect(space.width, space.height) + 0.5) * space.canvas_width
+    py = (0.5 - ny) * space.canvas_height
     return px, py
 
 
 def pixel_to_rv_normalized(
     px: float,
     py: float,
-    width: int,
-    height: int,
-    canvas_width: float,
-    canvas_height: float,
+    space: _PaintSpace,
 ) -> Point:
     """
     Kitsu -> OpenRV: convert Fabric.js canvas pixels to a normalized point of
     RV paint space. This is the inverse of `rv_normalized_to_pixel`.
     """
-    nx = (px / canvas_width - 0.5) * _aspect(width, height)
-    ny = 0.5 - py / canvas_height
+    nx = (px / space.canvas_width - 0.5) * _aspect(space.width, space.height)
+    ny = 0.5 - py / space.canvas_height
     return nx, ny
 
 
@@ -1341,10 +1350,7 @@ def _is_rv_eraser(shape: Dict[str, Any]) -> bool:
 
 def _rv_eraser_stroke(
     shape: Dict[str, Any],
-    width: int,
-    height: int,
-    canvas_width: float,
-    canvas_height: float,
+    space: _PaintSpace,
 ) -> Optional[Dict[str, Any]]:
     """
     Return an RV eraser pen as a canvas-px stroke, or None if it has no points.
@@ -1355,16 +1361,14 @@ def _rv_eraser_stroke(
     points = [
         (_clean(x), _clean(y))
         for x, y in (
-            rv_normalized_to_pixel(
-                nx, ny, width, height, canvas_width, canvas_height
-            )
+            rv_normalized_to_pixel(nx, ny, space)
             for nx, ny in (props.get("points") or [])
         )
     ]
     if not points:
         return None
     width_px = max(
-        rv_width_to_px(w, canvas_height)
+        rv_width_to_px(w, space.canvas_height)
         for w in _per_point_widths(props.get("width"), len(points))
     )
     return {
@@ -1464,20 +1468,13 @@ def _order_with_erasers(
 
 def _norm_box(
     box: Sequence[float],
-    width: int,
-    height: int,
-    canvas_width: float,
-    canvas_height: float,
+    space: _PaintSpace,
 ) -> Tuple[float, float, float, float]:
     """
     Return a canvas-px box in RV normalized coordinates (still min/max).
     """
-    x0, y0 = pixel_to_rv_normalized(
-        box[0], box[1], width, height, canvas_width, canvas_height
-    )
-    x1, y1 = pixel_to_rv_normalized(
-        box[2], box[3], width, height, canvas_width, canvas_height
-    )
+    x0, y0 = pixel_to_rv_normalized(box[0], box[1], space)
+    x1, y1 = pixel_to_rv_normalized(box[2], box[3], space)
     return min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)
 
 
@@ -1579,19 +1576,13 @@ def _psstroke_bounds(
 
 def _pen_to_fabric(
     shape: Dict[str, Any],
-    width: int,
-    height: int,
-    canvas_width: float,
-    canvas_height: float,
+    space: _PaintSpace,
     author: str,
     clock_ms: List[int],
 ) -> Dict[str, Any]:
     props = shape["properties"]
     points_px = [
-        rv_normalized_to_pixel(
-            nx, ny, width, height, canvas_width, canvas_height
-        )
-        for nx, ny in props["points"]
+        rv_normalized_to_pixel(nx, ny, space) for nx, ny in props["points"]
     ]
     points_px = [(_clean(x), _clean(y)) for x, y in points_px]
 
@@ -1600,7 +1591,7 @@ def _pen_to_fabric(
     # point) and a 0..1 pressure for each point. The rendered width is the
     # same.
     widths_px = [
-        rv_width_to_px(w, canvas_height)
+        rv_width_to_px(w, space.canvas_height)
         for w in _per_point_widths(props.get("width"), len(points_px))
     ]
     stroke_width_px = _clean(max(widths_px) if widths_px else 1.0)
@@ -1630,8 +1621,8 @@ def _pen_to_fabric(
         stroke_width_px,
         _clean(rv_alpha(props.get("color", [])), 6),
         author,
-        canvas_width,
-        canvas_height,
+        space.canvas_width,
+        space.canvas_height,
         props.get("uuid"),
     )
     obj["startTime"] = start_time
@@ -1645,25 +1636,18 @@ def _pen_to_fabric(
 
 def _line_to_fabric(
     shape: Dict[str, Any],
-    width: int,
-    height: int,
-    canvas_width: float,
-    canvas_height: float,
+    space: _PaintSpace,
     author: str,
     clock_ms: List[int],
 ) -> Dict[str, Any]:
     props = shape["properties"]
     (sx, sy), (ex, ey) = props["startPos"][0], props["endPos"][0]
-    x1, y1 = rv_normalized_to_pixel(
-        sx, sy, width, height, canvas_width, canvas_height
-    )
-    x2, y2 = rv_normalized_to_pixel(
-        ex, ey, width, height, canvas_width, canvas_height
-    )
+    x1, y1 = rv_normalized_to_pixel(sx, sy, space)
+    x2, y2 = rv_normalized_to_pixel(ex, ey, space)
 
     left, top = min(x1, x2), min(y1, y2)
     bbox_w, bbox_h = abs(x2 - x1), abs(y2 - y1)
-    stroke_width_px = props.get("borderWidth", 0.01) * canvas_height
+    stroke_width_px = props.get("borderWidth", 0.01) * space.canvas_height
 
     start_time = clock_ms[0]
     end_time = start_time + MS_PER_STROKE_POINT * 2
@@ -1679,8 +1663,8 @@ def _line_to_fabric(
         round(stroke_width_px, 2),
         rv_alpha(props.get("borderColor", [])),
         author,
-        canvas_width,
-        canvas_height,
+        space.canvas_width,
+        space.canvas_height,
         props.get("uuid"),
     )
     obj["startTime"] = start_time
@@ -1707,26 +1691,19 @@ def _kitsu_shape_style(clock_ms: List[int]) -> Dict[str, Any]:
 
 def _rv_box_px(
     props: Dict[str, Any],
-    width: int,
-    height: int,
-    canvas_width: float,
-    canvas_height: float,
+    space: _PaintSpace,
 ) -> Tuple[float, float, float, float, Any]:
     """
     Return (x0, y0, x1, y1, stroke width) in canvas px of an RV ellipse or
     rect. RV stores it as the axis-aligned min/max corners of the box on which
     its outline is centred. x0/y0 is the top-left corner of the canvas.
     """
-    p0 = rv_normalized_to_pixel(
-        *props["min"][0], width, height, canvas_width, canvas_height
-    )
-    p1 = rv_normalized_to_pixel(
-        *props["max"][0], width, height, canvas_width, canvas_height
-    )
+    p0 = rv_normalized_to_pixel(*props["min"][0], space)
+    p1 = rv_normalized_to_pixel(*props["max"][0], space)
     x0, x1 = sorted((p0[0], p1[0]))
     y0, y1 = sorted((p0[1], p1[1]))
     stroke_width_px = _clean(
-        rv_width_to_px(props.get("borderWidth", 0.01), canvas_height)
+        rv_width_to_px(props.get("borderWidth", 0.01), space.canvas_height)
     )
     return x0, y0, x1, y1, stroke_width_px
 
@@ -1746,10 +1723,7 @@ def _rv_fill(props: Dict[str, Any]) -> str:
 
 def _ellipse_to_fabric(
     shape: Dict[str, Any],
-    width: int,
-    height: int,
-    canvas_width: float,
-    canvas_height: float,
+    space: _PaintSpace,
     author: str,
     clock_ms: List[int],
 ) -> Dict[str, Any]:
@@ -1760,9 +1734,7 @@ def _ellipse_to_fabric(
     strokeUniform is on, so the outline keeps the same thickness all round.
     """
     props = shape["properties"]
-    x0, y0, x1, y1, stroke_width_px = _rv_box_px(
-        props, width, height, canvas_width, canvas_height
-    )
+    x0, y0, x1, y1, stroke_width_px = _rv_box_px(props, space)
     cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
     rx, ry = (x1 - x0) / 2.0, (y1 - y0) / 2.0
 
@@ -1788,8 +1760,8 @@ def _ellipse_to_fabric(
         stroke_width_px,
         _clean(rv_alpha(border), 6),
         author,
-        canvas_width,
-        canvas_height,
+        space.canvas_width,
+        space.canvas_height,
         props.get("uuid"),
     )
     obj.update(
@@ -1810,10 +1782,7 @@ def _ellipse_to_fabric(
 
 def _rect_to_fabric(
     shape: Dict[str, Any],
-    width: int,
-    height: int,
-    canvas_width: float,
-    canvas_height: float,
+    space: _PaintSpace,
     author: str,
     clock_ms: List[int],
 ) -> Dict[str, Any]:
@@ -1824,9 +1793,7 @@ def _rect_to_fabric(
     centre line of the outline.
     """
     props = shape["properties"]
-    x0, y0, x1, y1, stroke_width_px = _rv_box_px(
-        props, width, height, canvas_width, canvas_height
-    )
+    x0, y0, x1, y1, stroke_width_px = _rv_box_px(props, space)
     half_sw = stroke_width_px / 2.0
 
     border = props.get("borderColor", [])
@@ -1840,8 +1807,8 @@ def _rect_to_fabric(
         stroke_width_px,
         _clean(rv_alpha(border), 6),
         author,
-        canvas_width,
-        canvas_height,
+        space.canvas_width,
+        space.canvas_height,
         props.get("uuid"),
     )
     obj.update(
@@ -1871,10 +1838,7 @@ def _rv_arrow_width(props: Dict[str, Any]) -> float:
 
 def _arrow_to_fabric(
     shape: Dict[str, Any],
-    width: int,
-    height: int,
-    canvas_width: float,
-    canvas_height: float,
+    space: _PaintSpace,
     author: str,
     clock_ms: List[int],
 ) -> Dict[str, Any]:
@@ -1884,14 +1848,10 @@ def _arrow_to_fabric(
     stroke-inclusive box. So left/top are half a stroke outside the ends.
     """
     props = shape["properties"]
-    x1, y1 = rv_normalized_to_pixel(
-        *props["startPos"][0], width, height, canvas_width, canvas_height
-    )
-    x2, y2 = rv_normalized_to_pixel(
-        *props["endPos"][0], width, height, canvas_width, canvas_height
-    )
+    x1, y1 = rv_normalized_to_pixel(*props["startPos"][0], space)
+    x2, y2 = rv_normalized_to_pixel(*props["endPos"][0], space)
     stroke_width_px = _clean(
-        rv_width_to_px(_rv_arrow_width(props), canvas_height)
+        rv_width_to_px(_rv_arrow_width(props), space.canvas_height)
     )
     half_sw = stroke_width_px / 2.0
 
@@ -1906,8 +1866,8 @@ def _arrow_to_fabric(
         stroke_width_px,
         _clean(rv_alpha(border), 6),
         author,
-        canvas_width,
-        canvas_height,
+        space.canvas_width,
+        space.canvas_height,
         props.get("uuid"),
     )
     obj.update(
@@ -1927,10 +1887,7 @@ def _arrow_to_fabric(
 
 def _text_to_fabric(
     shape: Dict[str, Any],
-    width: int,
-    height: int,
-    canvas_width: float,
-    canvas_height: float,
+    space: _PaintSpace,
     author: str,
     clock_ms: List[int],
 ) -> Optional[Dict[str, Any]]:
@@ -1949,12 +1906,11 @@ def _text_to_fabric(
 
     ax, ay = rv_normalized_to_pixel(
         *_rv_point(props["position"]),
-        width,
-        height,
-        canvas_width,
-        canvas_height,
+        space,
     )
-    font_px = _clean(rv_width_to_px(_rv_text_font_size(props), canvas_height))
+    font_px = _clean(
+        rv_width_to_px(_rv_text_font_size(props), space.canvas_height)
+    )
     lines = text.split("\n")
     # Default strokeWidth of Fabric. It pads the box of a text that has no
     # stroke.
@@ -1974,8 +1930,8 @@ def _text_to_fabric(
         stroke_width,
         _clean(rv_alpha(color), 6),
         author,
-        canvas_width,
-        canvas_height,
+        space.canvas_width,
+        space.canvas_height,
         props.get("uuid"),
     )
     obj.update(
@@ -2206,10 +2162,7 @@ _SHAPE_CONVERTERS = {
 
 def _convert_frame_shapes(
     shapes: Sequence[Dict[str, Any]],
-    width: int,
-    height: int,
-    canvas_width: float,
-    canvas_height: float,
+    space: _PaintSpace,
     author: str,
     clock_ms: List[int],
 ) -> List[Dict[str, Any]]:
@@ -2220,9 +2173,7 @@ def _convert_frame_shapes(
     entries: List[Dict[str, Any]] = []
     for shape in shapes:
         if _is_rv_eraser(shape):
-            stroke = _rv_eraser_stroke(
-                shape, width, height, canvas_width, canvas_height
-            )
+            stroke = _rv_eraser_stroke(shape, space)
             if stroke is None:
                 continue
             # As the eraser brush of Fabric does: the stroke goes on every
@@ -2243,9 +2194,7 @@ def _convert_frame_shapes(
                 f"'{shape_type}' (name={shape.get('name')!r})"
             )
             continue
-        obj = converter(
-            shape, width, height, canvas_width, canvas_height, author, clock_ms
-        )
+        obj = converter(shape, space, author, clock_ms)
         if obj is not None:
             entries.append({"obj": obj, "erasers": []})
     return entries
@@ -2314,8 +2263,9 @@ def convertToKitsu(
     inferred_w, inferred_h = _infer_canvas_size(
         reference_records, width, height
     )
-    canvas_width = canvas_width or inferred_w
-    canvas_height = canvas_height or inferred_h
+    space = _PaintSpace(
+        width, height, canvas_width or inferred_w, canvas_height or inferred_h
+    )
 
     by_frame: Dict[int, List[Dict[str, Any]]] = {}
     for shape in openrv_shapes:
@@ -2332,13 +2282,7 @@ def convertToKitsu(
 
     for frame_num in sorted(by_frame):
         entries = _convert_frame_shapes(
-            by_frame[frame_num],
-            width,
-            height,
-            canvas_width,
-            canvas_height,
-            author,
-            clock_ms,
+            by_frame[frame_num], space, author, clock_ms
         )
         objects = _resolve_frame_objects(entries, frame_num, ref_index)
         if objects:
@@ -2360,28 +2304,23 @@ def convertToKitsu(
 
 def _pen_from_fabric(
     obj: Dict[str, Any],
-    width: int,
-    height: int,
-    canvas_width: float,
-    canvas_height: float,
+    space: _PaintSpace,
     frame_num: int,
 ) -> Dict[str, Any]:
     stroke_points = obj.get("strokePoints", [])
     points_norm = [
-        pixel_to_rv_normalized(
-            p["x"], p["y"], width, height, canvas_width, canvas_height
-        )
-        for p in stroke_points
+        pixel_to_rv_normalized(p["x"], p["y"], space) for p in stroke_points
     ]
 
     # psbrush draws each segment at pressure * strokeWidth. RV pens take a
     # width for each point. So apply the pressure to the width (RV annotate
     # mode does the same with tablet pressure). The mouse fallback pressure of
     # Kitsu is 0.5 when a point has none.
-    stroke_width_px = float(obj.get("strokeWidth", 0.01 * canvas_height))
+    stroke_width_px = float(obj.get("strokeWidth", 0.01 * space.canvas_height))
     widths_norm = [
         px_width_to_rv(
-            stroke_width_px * float(p.get("pressure", 0.5)), canvas_height
+            stroke_width_px * float(p.get("pressure", 0.5)),
+            space.canvas_height,
         )
         for p in stroke_points
     ]
@@ -2402,25 +2341,18 @@ def _pen_from_fabric(
 
 def _line_from_fabric(
     obj: Dict[str, Any],
-    width: int,
-    height: int,
-    canvas_width: float,
-    canvas_height: float,
+    space: _PaintSpace,
     frame_num: int,
 ) -> Dict[str, Any]:
     x1, y1 = obj.get("x1", obj["left"]), obj.get("y1", obj["top"])
     x2 = obj.get("x2", obj["left"] + obj["width"])
     y2 = obj.get("y2", obj["top"] + obj["height"])
 
-    start = pixel_to_rv_normalized(
-        x1, y1, width, height, canvas_width, canvas_height
-    )
-    end = pixel_to_rv_normalized(
-        x2, y2, width, height, canvas_width, canvas_height
-    )
+    start = pixel_to_rv_normalized(x1, y1, space)
+    end = pixel_to_rv_normalized(x2, y2, space)
 
-    stroke_width_px = obj.get("strokeWidth", 0.01 * canvas_height)
-    border_width_norm = stroke_width_px / canvas_height
+    stroke_width_px = obj.get("strokeWidth", 0.01 * space.canvas_height)
+    border_width_norm = stroke_width_px / space.canvas_height
 
     return {
         "type": "line",
@@ -2440,10 +2372,7 @@ def _line_from_fabric(
 def _box_from_fabric(
     kind: str,
     obj: Dict[str, Any],
-    width: int,
-    height: int,
-    canvas_width: float,
-    canvas_height: float,
+    space: _PaintSpace,
     frame_num: int,
 ) -> Dict[str, Any]:
     """
@@ -2460,12 +2389,8 @@ def _box_from_fabric(
 
     # Canvas y goes down and RV y goes up. So the bottom-left corner of the
     # canvas is the min of RV, and the top-right corner is the max of RV.
-    min_pt = pixel_to_rv_normalized(
-        cx - rx, cy + ry, width, height, canvas_width, canvas_height
-    )
-    max_pt = pixel_to_rv_normalized(
-        cx + rx, cy - ry, width, height, canvas_width, canvas_height
-    )
+    min_pt = pixel_to_rv_normalized(cx - rx, cy + ry, space)
+    max_pt = pixel_to_rv_normalized(cx + rx, cy - ry, space)
 
     opacity = obj.get("opacity", 1.0)
     fill = obj.get("fill")
@@ -2482,7 +2407,9 @@ def _box_from_fabric(
             "uuid": obj.get("id"),
             "min": [min_pt],
             "max": [max_pt],
-            "borderWidth": px_width_to_rv(stroke_width_px, canvas_height),
+            "borderWidth": px_width_to_rv(
+                stroke_width_px, space.canvas_height
+            ),
             "borderColor": color_to_rv_color(obj.get("stroke"), opacity),
             "innerColor": inner_color,
             # The other properties that RV ellipses and rects have: shown on
@@ -2497,26 +2424,18 @@ def _box_from_fabric(
 
 def _ellipse_from_fabric(
     obj: Dict[str, Any],
-    width: int,
-    height: int,
-    canvas_width: float,
-    canvas_height: float,
+    space: _PaintSpace,
     frame_num: int,
 ) -> Dict[str, Any]:
     """
     Convert a Kitsu "circle" (or Fabric "ellipse") to an RV "ellipse".
     """
-    return _box_from_fabric(
-        "ellipse", obj, width, height, canvas_width, canvas_height, frame_num
-    )
+    return _box_from_fabric("ellipse", obj, space, frame_num)
 
 
 def _rect_from_fabric(
     obj: Dict[str, Any],
-    width: int,
-    height: int,
-    canvas_width: float,
-    canvas_height: float,
+    space: _PaintSpace,
     frame_num: int,
 ) -> Dict[str, Any]:
     """
@@ -2529,17 +2448,12 @@ def _rect_from_fabric(
             f"(rx={obj.get('rx')}, ry={obj.get('ry')}); OpenRV rects are "
             f"square-cornered, dropping the rounding"
         )
-    return _box_from_fabric(
-        "rect", obj, width, height, canvas_width, canvas_height, frame_num
-    )
+    return _box_from_fabric("rect", obj, space, frame_num)
 
 
 def _arrow_from_fabric(
     obj: Dict[str, Any],
-    width: int,
-    height: int,
-    canvas_width: float,
-    canvas_height: float,
+    space: _PaintSpace,
     frame_num: int,
 ) -> Dict[str, Any]:
     """
@@ -2549,14 +2463,10 @@ def _arrow_from_fabric(
     them.
     """
     (tx, ty), (hx, hy), stroke_width_px = _fabric_line_endpoints(obj)
-    start = pixel_to_rv_normalized(
-        tx, ty, width, height, canvas_width, canvas_height
-    )
-    end = pixel_to_rv_normalized(
-        hx, hy, width, height, canvas_width, canvas_height
-    )
+    start = pixel_to_rv_normalized(tx, ty, space)
+    end = pixel_to_rv_normalized(hx, hy, space)
 
-    width_rv = px_width_to_rv(stroke_width_px, canvas_height)
+    width_rv = px_width_to_rv(stroke_width_px, space.canvas_height)
     # RV arrows carry the line color in both borderColor and innerColor.
     color = color_to_rv_color(obj.get("stroke"), obj.get("opacity", 1.0))
 
@@ -2581,10 +2491,7 @@ def _arrow_from_fabric(
 
 def _text_from_fabric(
     obj: Dict[str, Any],
-    width: int,
-    height: int,
-    canvas_width: float,
-    canvas_height: float,
+    space: _PaintSpace,
     frame_num: int,
 ) -> Dict[str, Any]:
     """
@@ -2594,10 +2501,8 @@ def _text_from_fabric(
     left-aligned and without a background, in its default font.
     """
     ax, ay, font_px = _fabric_text_anchor(obj)
-    position = pixel_to_rv_normalized(
-        ax, ay, width, height, canvas_width, canvas_height
-    )
-    font_size = px_width_to_rv(font_px, canvas_height)
+    position = pixel_to_rv_normalized(ax, ay, space)
+    font_size = px_width_to_rv(font_px, space.canvas_height)
     text = _clean_text(obj.get("text"))
 
     if float(obj.get("angle") or 0) % 360:
@@ -2732,28 +2637,23 @@ def _collect_erasers(
     obj: Dict[str, Any],
     index: int,
     erasers: List[Dict[str, Any]],
-    width: int,
-    height: int,
-    canvas_width: float,
-    canvas_height: float,
+    space: _PaintSpace,
 ) -> None:
     """
     Add the eraser strokes of `obj` to `erasers`, in RV units. Fabric stores a
     copy of a stroke on every object that it cut. So a stroke that is already
     in `erasers` only records that it also cut this object.
     """
-    tol = MATCH_TOLERANCE_PX / canvas_height
+    tol = MATCH_TOLERANCE_PX / space.canvas_height
     for e_i, entry in enumerate(_fabric_eraser_entries(obj)):
         for s_i, stroke in enumerate(entry["strokes"]):
             points = [
-                pixel_to_rv_normalized(
-                    x, y, width, height, canvas_width, canvas_height
-                )
+                pixel_to_rv_normalized(x, y, space)
                 for x, y in stroke["points"]
             ]
             norm = {
                 "points": points,
-                "width": px_width_to_rv(stroke["width"], canvas_height),
+                "width": px_width_to_rv(stroke["width"], space.canvas_height),
             }
             same = next(
                 (e for e in erasers if _same_eraser_stroke(e, norm, tol)),
@@ -2791,11 +2691,11 @@ def _record_to_orv(
 
     for index, obj in enumerate(objects):
         obj_type = obj.get("type")
-        obj_canvas_width = float(
-            obj.get("canvasWidth") or default_canvas_width
-        )
-        obj_canvas_height = float(
-            obj.get("canvasHeight") or default_canvas_height
+        space = _PaintSpace(
+            width,
+            height,
+            float(obj.get("canvasWidth") or default_canvas_width),
+            float(obj.get("canvasHeight") or default_canvas_height),
         )
 
         converter = _TYPE_CONVERTERS.get(obj_type)
@@ -2808,10 +2708,7 @@ def _record_to_orv(
         else:
             shape = converter(
                 obj,
-                width,
-                height,
-                obj_canvas_width,
-                obj_canvas_height,
+                space,
                 frame_num,
             )
         if shape is not None:
@@ -2821,10 +2718,7 @@ def _record_to_orv(
                     "shape": shape,
                     "bbox": _norm_box(
                         _fabric_aabb(obj),
-                        width,
-                        height,
-                        obj_canvas_width,
-                        obj_canvas_height,
+                        space,
                     ),
                 }
             )
@@ -2833,10 +2727,7 @@ def _record_to_orv(
             obj,
             index,
             erasers,
-            width,
-            height,
-            obj_canvas_width,
-            obj_canvas_height,
+            space,
         )
 
     return _order_with_erasers(items, erasers, frame_num)

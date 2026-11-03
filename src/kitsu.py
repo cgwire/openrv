@@ -15,6 +15,7 @@ import html
 from contextlib import contextmanager
 from datetime import datetime
 
+from kitsu_review_log import log
 from kitsu_review_model import (
     DEFAULT_SERVER,
     STATUS_FALLBACK_COLOR,
@@ -23,7 +24,6 @@ from kitsu_review_model import (
     KitsuReviewModel,
     SessionRejected,
     format_fps,
-    log,
     normalize_server,
     status_full_name,
     status_short_label,
