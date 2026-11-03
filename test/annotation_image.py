@@ -46,14 +46,16 @@ def main():
     ]
     if not wfa_tasks:
         sys.exit(
-            f"No task with status {wfa_status['name']} for shot {shot['name']}."
+            f"No task with status {wfa_status['name']} for shot "
+            f"{shot['name']}."
         )
 
     if len(wfa_tasks) > 1:
         # Several tasks waiting for approval: take the most recently updated one.
         wfa_tasks.sort(key=lambda t: t.get("updated_at") or "", reverse=True)
         print(
-            f"Warning: {len(wfa_tasks)} WFA tasks found for shot {shot['name']}, "
+            f"Warning: {len(wfa_tasks)} WFA tasks found for shot "
+            f"{shot['name']}, "
             "using the most recently updated one."
         )
     task = wfa_tasks[0]

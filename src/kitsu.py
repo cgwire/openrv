@@ -10,6 +10,7 @@ and message boxes.
 from __future__ import annotations
 
 import html
+from contextlib import contextmanager
 from datetime import datetime
 
 from kitsu_review_model import (
@@ -20,6 +21,7 @@ from kitsu_review_model import (
     KitsuReviewModel,
     SessionRejected,
     format_fps,
+    log,
     normalize_server,
     status_full_name,
     status_short_label,
@@ -38,6 +40,36 @@ except ImportError:
 
 _QWidgetBase = QtWidgets.QWidget if _INSIDE_OPENRV else object
 _MinorModeBase = rv.rvtypes.MinorMode if _INSIDE_OPENRV else object
+
+
+@contextmanager
+def _wait_cursor():
+    QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+    try:
+        yield
+    finally:
+        QtWidgets.QApplication.restoreOverrideCursor()
+
+
+def _revision_label(rev):
+    return f"v{rev['revision']:03d}"
+
+
+def _set_bold(table, row, columns, bold):
+    for column in columns:
+        cell = table.item(row, column)
+        if cell is not None:
+            font = cell.font()
+            font.setBold(bold)
+            cell.setFont(font)
+
+
+def _table_cell(table, row, column):
+    item = table.item(row, column)
+    if item is None:
+        item = QtWidgets.QTableWidgetItem()
+        table.setItem(row, column, item)
+    return item
 
 
 def _status_qcolor(status):
@@ -237,13 +269,18 @@ class KitsuReviewPanel(_QWidgetBase):
         splitter.addWidget(self.right_tabs)
         splitter.setSizes([420, 480])
 
-    def _make_revision_table(self):
-        table = QtWidgets.QTableWidget(0, len(self.REVISION_COLUMNS))
-        table.setHorizontalHeaderLabels(list(self.REVISION_COLUMNS))
+    @staticmethod
+    def _make_table(columns):
+        table = QtWidgets.QTableWidget(0, len(columns))
+        table.setHorizontalHeaderLabels(list(columns))
         table.horizontalHeader().setStretchLastSection(True)
         table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        return table
+
+    def _make_revision_table(self):
+        table = self._make_table(self.REVISION_COLUMNS)
         table.itemSelectionChanged.connect(
             lambda: self._on_revision_selected(table)
         )
@@ -284,23 +321,8 @@ class KitsuReviewPanel(_QWidgetBase):
         layout.addLayout(controls)
 
         split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        self.playlist_table = QtWidgets.QTableWidget(
-            0, len(self.PLAYLIST_COLUMNS)
-        )
-        self.playlist_table.setHorizontalHeaderLabels(
-            list(self.PLAYLIST_COLUMNS)
-        )
-        self.playlist_table.horizontalHeader().setStretchLastSection(True)
+        self.playlist_table = self._make_table(self.PLAYLIST_COLUMNS)
         self.playlist_table.verticalHeader().setVisible(False)
-        self.playlist_table.setSelectionBehavior(
-            QtWidgets.QAbstractItemView.SelectRows
-        )
-        self.playlist_table.setSelectionMode(
-            QtWidgets.QAbstractItemView.SingleSelection
-        )
-        self.playlist_table.setEditTriggers(
-            QtWidgets.QAbstractItemView.NoEditTriggers
-        )
         self.playlist_table.itemSelectionChanged.connect(
             self._on_playlist_selected
         )
@@ -369,7 +391,8 @@ class KitsuReviewPanel(_QWidgetBase):
         self.dev_auto_check.setChecked(True)
         self.dev_auto_check.setToolTip(
             "Re-read the RV session every second while this tab is open "
-            "(not used for the Kitsu server view, to avoid polling the server)."
+            "(not used for the Kitsu server view, to avoid polling the "
+            "server)."
         )
         self.dev_auto_check.toggled.connect(self._update_dev_timer)
         controls.addWidget(self.dev_auto_check)
@@ -408,8 +431,7 @@ class KitsuReviewPanel(_QWidgetBase):
 
     def _dev_tab_active(self):
         return (
-            hasattr(self, "right_tabs")
-            and self.right_tabs.currentWidget() is self.dev_tab
+            self.right_tabs.currentWidget() is self.dev_tab
             and self.isVisible()
         )
 
@@ -447,8 +469,6 @@ class KitsuReviewPanel(_QWidgetBase):
         self.dev_status_label.setText("JSON copied to clipboard.")
 
     def _refresh_dev_view(self):
-        if not hasattr(self, "dev_json_view"):
-            return
         text, status = self.model.build_dev_view(
             self.dev_view_combo.currentData(), self.dev_scope_check.isChecked()
         )
@@ -523,20 +543,19 @@ class KitsuReviewPanel(_QWidgetBase):
             return
 
         self.login_btn.setEnabled(False)
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            user = self.model.authenticate(server, email, password)
+            with _wait_cursor():
+                user = self.model.authenticate(server, email, password)
         except Exception as exc:
-            QtWidgets.QApplication.restoreOverrideCursor()
             self.login_btn.setEnabled(True)
             QtWidgets.QMessageBox.critical(
                 self,
                 "Kitsu",
-                f"Login failed.\n\nServer: {server}\nUser: {email}\n\nError: {exc}",
+                f"Login failed.\n\nServer: {server}\nUser: {email}\n\nError: "
+                f"{exc}",
             )
             return
 
-        QtWidgets.QApplication.restoreOverrideCursor()
         self.login_btn.setEnabled(True)
         # Don't keep the password around in the widget once it's been used.
         self.pass_field.clear()
@@ -572,9 +591,9 @@ class KitsuReviewPanel(_QWidgetBase):
 
         self.status_label.setText("Restoring Kitsu session...")
         self.login_btn.setEnabled(False)
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            user = self.model.restore_session(server, email, tokens)
+            with _wait_cursor():
+                user = self.model.restore_session(server, email, tokens)
         except SessionRejected:
             self.status_label.setText(
                 "Saved Kitsu session expired -- please log in"
@@ -582,11 +601,11 @@ class KitsuReviewPanel(_QWidgetBase):
             return
         except Exception:
             self.status_label.setText(
-                "Could not reach Kitsu to restore your session -- log in or try again later"
+                "Could not reach Kitsu to restore your session -- log in or "
+                "try again later"
             )
             return
         finally:
-            QtWidgets.QApplication.restoreOverrideCursor()
             self.login_btn.setEnabled(True)
 
         self.model.complete_login(user, server, email)
@@ -669,10 +688,7 @@ class KitsuReviewPanel(_QWidgetBase):
     def _set_status_cell(self, table, row, rev):
         """Status text and swatch; revisions waiting on review are shown
         in bold."""
-        item = table.item(row, self.STATUS_COLUMN)
-        if item is None:
-            item = QtWidgets.QTableWidgetItem()
-            table.setItem(row, self.STATUS_COLUMN, item)
+        item = _table_cell(table, row, self.STATUS_COLUMN)
         item.setText(str(rev["status"]))
         status = self.model.status_for_id(rev["task"].get("task_status_id"))
         tooltip = status_full_name(status) if status else str(rev["status"])
@@ -683,12 +699,7 @@ class KitsuReviewPanel(_QWidgetBase):
         if pending:
             tooltip += " -- awaiting review"
         item.setToolTip(tooltip)
-        for column in (self.SHOT_COLUMN, self.STATUS_COLUMN):
-            cell = table.item(row, column)
-            if cell is not None:
-                font = cell.font()
-                font.setBold(pending)
-                cell.setFont(font)
+        _set_bold(table, row, (self.SHOT_COLUMN, self.STATUS_COLUMN), pending)
 
     def _refresh_status_cells(self):
         """Redraw every listed revision's status (after a status change,
@@ -747,7 +758,7 @@ class KitsuReviewPanel(_QWidgetBase):
             values = [
                 rev["shot"],
                 rev["task_type"],
-                f"v{rev['revision']:03d}",
+                _revision_label(rev),
                 rev["status"],
                 rev["date"],
             ]
@@ -814,18 +825,16 @@ class KitsuReviewPanel(_QWidgetBase):
         if not self.model.logged_in or not self.model.current_user:
             return
 
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            revisions = self.model.load_my_checks()
-            self._checks_rows = revisions
-            self._fill_revision_table(self.checks_table, revisions)
+            with _wait_cursor():
+                revisions = self.model.load_my_checks()
+                self._checks_rows = revisions
+                self._fill_revision_table(self.checks_table, revisions)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(
                 self, "Kitsu", f"Failed to fetch tasks: {exc}"
             )
             return
-        finally:
-            QtWidgets.QApplication.restoreOverrideCursor()
 
         self._tab_loaded[self.CHECKS_TAB] = True
         self.checks_info.setText(
@@ -843,16 +852,14 @@ class KitsuReviewPanel(_QWidgetBase):
         if not self.model.logged_in or not self.model.current_user:
             return
 
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            playlists = self.model.load_playlists()
+            with _wait_cursor():
+                playlists = self.model.load_playlists()
         except Exception as exc:
-            QtWidgets.QApplication.restoreOverrideCursor()
             QtWidgets.QMessageBox.critical(
                 self, "Kitsu", f"Failed to fetch playlists: {exc}"
             )
             return
-        QtWidgets.QApplication.restoreOverrideCursor()
 
         self._tab_loaded[self.PLAYLISTS_TAB] = True
         self._playlist_rows = []
@@ -898,29 +905,23 @@ class KitsuReviewPanel(_QWidgetBase):
         if pending is None:
             tip = "Couldn't work out how many shots are awaiting review."
         elif summary["pending_exact"]:
-            tip = f"{pending} of {summary['entry_count']} revision(s) awaiting review."
+            tip = (
+                f"{pending} of {summary['entry_count']} revision(s) awaiting "
+                f"review."
+            )
         else:
             tip = (
-                f"About {pending} of {summary['entry_count']} shot(s) awaiting "
+                f"About {pending} of {summary['entry_count']} shot(s) "
+                f"awaiting "
                 "review (exact once the playlist is opened)."
             )
             text = "~" + text
 
-        item = self.playlist_table.item(row, self.PLAYLIST_PENDING_COLUMN)
-        if item is None:
-            item = QtWidgets.QTableWidgetItem()
-            self.playlist_table.setItem(
-                row, self.PLAYLIST_PENDING_COLUMN, item
-            )
+        table = self.playlist_table
+        item = _table_cell(table, row, self.PLAYLIST_PENDING_COLUMN)
         item.setText(text)
         item.setToolTip(tip)
-        bold = bool(pending)
-        for column in range(self.playlist_table.columnCount()):
-            cell = self.playlist_table.item(row, column)
-            if cell is not None:
-                font = cell.font()
-                font.setBold(bold)
-                cell.setFont(font)
+        _set_bold(table, row, range(table.columnCount()), bool(pending))
 
     @staticmethod
     def _playlist_is_pending(summary):
@@ -960,7 +961,8 @@ class KitsuReviewPanel(_QWidgetBase):
                 )
             if not self.model.feedback_status_ids():
                 text += (
-                    " No task status is flagged as a feedback request in Kitsu, "
+                    " No task status is flagged as a feedback request in "
+                    "Kitsu, "
                     "so awaiting-review counts are unknown."
                 )
         self.playlists_info.setText(text)
@@ -974,11 +976,13 @@ class KitsuReviewPanel(_QWidgetBase):
         row = rows[0].row()
         summary = self.model.playlists[row]
 
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            revisions, skipped = self.model.load_playlist_revisions(summary)
-            self._playlist_rows = revisions
-            self._fill_revision_table(self.playlist_rev_table, revisions)
+            with _wait_cursor():
+                revisions, skipped = self.model.load_playlist_revisions(
+                    summary
+                )
+                self._playlist_rows = revisions
+                self._fill_revision_table(self.playlist_rev_table, revisions)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(
                 self,
@@ -986,14 +990,15 @@ class KitsuReviewPanel(_QWidgetBase):
                 f"Failed to load playlist {summary['name']!r}: {exc}",
             )
             return
-        finally:
-            QtWidgets.QApplication.restoreOverrideCursor()
 
         self._set_playlist_pending_cell(row)
         pending = sum(
             1 for rev in revisions if self.model.is_pending_review(rev["task"])
         )
-        text = f"{summary['name']}: {len(revisions)} revision(s), {pending} awaiting review."
+        text = (
+            f"{summary['name']}: {len(revisions)} revision(s), {pending} "
+            f"awaiting review."
+        )
         if skipped:
             text += (
                 f" Skipped {skipped} shot(s) with no readable revision "
@@ -1021,7 +1026,8 @@ class KitsuReviewPanel(_QWidgetBase):
             color = _status_qcolor(status).name()
             status_html = (
                 f"<span style='background-color: {color}; color: #111; "
-                f"padding: 0 4px;'>&nbsp;{status_short_label(status)}&nbsp;</span> "
+                f"padding: 0 "
+                f"4px;'>&nbsp;{status_short_label(status)}&nbsp;</span> "
                 f"{rev['status']}"
             )
         else:
@@ -1036,9 +1042,12 @@ class KitsuReviewPanel(_QWidgetBase):
             else ""
         )
         self.detail_label.setText(
-            f"<b>{rev['shot']}</b> &nbsp;|&nbsp; {rev['task_type']} &nbsp;|&nbsp; "
-            f"Revision v{rev['revision']:03d} &nbsp;|&nbsp; Status: {status_html}"
-            f"<br>Artist: {rev['artist']} &nbsp;|&nbsp; Submitted: {rev['date']}"
+            f"<b>{rev['shot']}</b> &nbsp;|&nbsp; {rev['task_type']} "
+            f"&nbsp;|&nbsp; "
+            f"Revision v{rev['revision']:03d} &nbsp;|&nbsp; Status: "
+            f"{status_html}"
+            f"<br>Artist: {rev['artist']} &nbsp;|&nbsp; Submitted: "
+            f"{rev['date']}"
             f" &nbsp;|&nbsp; FPS: {fps_html}{playlist_html}"
         )
 
@@ -1064,17 +1073,13 @@ class KitsuReviewPanel(_QWidgetBase):
             return
         task = rev["task"]
 
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            comments = self.model.load_comments(task)
+            with _wait_cursor():
+                comments = self.model.load_comments(task)
         except Exception as exc:
-            QtWidgets.QApplication.restoreOverrideCursor()
-            print(
-                f"[KitsuReview] Could not fetch comments for task {task.get('id')}: {exc}"
-            )
+            log(f"Could not fetch comments for task {task.get('id')}: {exc}")
             self.comments_list.addItem("(Failed to load comments from Kitsu)")
             return
-        QtWidgets.QApplication.restoreOverrideCursor()
 
         for comment in comments:
             status = comment["status"]
@@ -1110,23 +1115,22 @@ class KitsuReviewPanel(_QWidgetBase):
             QtWidgets.QMessageBox.critical(
                 self,
                 "Kitsu",
-                "Could not determine a status for this comment; comment not sent.",
+                "Could not determine a status for this comment; comment not "
+                "sent.",
             )
             return
 
         self.add_comment_btn.setEnabled(False)
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            status_changed = self.model.add_comment(rev, text, status_id)
+            with _wait_cursor():
+                status_changed = self.model.add_comment(rev, text, status_id)
         except Exception as exc:
-            QtWidgets.QApplication.restoreOverrideCursor()
             self.add_comment_btn.setEnabled(True)
             QtWidgets.QMessageBox.critical(
                 self, "Kitsu", f"Failed to post comment: {exc}"
             )
             return
 
-        QtWidgets.QApplication.restoreOverrideCursor()
         self.add_comment_btn.setEnabled(True)
         self.comment_input.clear()
 
@@ -1184,11 +1188,13 @@ class KitsuReviewPanel(_QWidgetBase):
         QtWidgets.QMessageBox.information(
             self,
             "Kitsu",
-            f"Downloaded and loaded into RV:\n\n{rev['shot']} - {rev['task_type']} v{rev['revision']:03d}\n"
+            f"Downloaded and loaded into RV:\n\n{rev['shot']} - "
+            f"{rev['task_type']} v{rev['revision']:03d}\n"
             f"(saved to: {file_path})\n"
             f"Playback set to {format_fps(rev.get('fps'))} fps"
             f"{' (production setting)' if rev.get('fps_from_project') else ' (default)'}\n\n"
-            "Use RV's Paint tools to annotate frames directly on the viewport.",
+            "Use RV's Paint tools to annotate frames directly on the "
+            "viewport.",
         )
 
     def _on_export_clicked(self):

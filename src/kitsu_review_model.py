@@ -3,7 +3,7 @@
 Everything that isn't UI lives here: talking to Kitsu through gazu,
 persisting the login session, the task-status rules, and reading/writing
 annotations in the RV session's paint nodes. No widgets are created in
-this module -- kitsu_review_view.py owns the panel and calls into
+this module -- kitsu.py owns the panel and calls into
 KitsuReviewModel from its handlers.
 """
 
@@ -13,7 +13,6 @@ import json
 import math
 import os
 import re
-import sys
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
@@ -107,6 +106,10 @@ class DimensionsUnknownError(ValueError):
 # ----------------------------------------------------------------------
 
 
+def log(message):
+    print(f"[KitsuReview] {message}")
+
+
 def _preview_revision(preview_file):
     """Best-effort revision number for a gazu preview file dict."""
     return preview_file.get("revision", 0) or 0
@@ -155,10 +158,7 @@ def normalize_server(url):
 def _thumbnail_url(preview_file_id):
     """Best-effort Kitsu thumbnail URL for a preview file.
 
-    Thumbnails are served from Kitsu's picture routes, which live at the
-    server root rather than under "/api" (unlike the rest of the gazu
-    API), so the "/api" suffix on the configured host has to be
-    stripped first.
+    Goes through the configured host, like the rest of the gazu API.
     """
     host = gazu.client.get_host()
     return f"{host}/pictures/originals/preview-files/{preview_file_id}.png"
@@ -303,9 +303,8 @@ def _preview_dimensions(preview_file, entity=None, file_path=None):
 
     for record in preview_file.get("annotations") or []:
         for obj in record.get("drawing", {}).get("objects", []):
-            canvas_w, canvas_h = obj.get("canvasWidth"), obj.get(
-                "canvasHeight"
-            )
+            canvas_w = obj.get("canvasWidth")
+            canvas_h = obj.get("canvasHeight")
             if canvas_w and canvas_h:
                 return int(round(float(canvas_w))), int(round(float(canvas_h)))
 
@@ -387,8 +386,8 @@ class _SessionStore:
                     KEYRING_SERVICE, self._account(server, email, kind)
                 )
             except Exception as exc:
-                print(
-                    f"[KitsuReview] Could not read the saved session from the "
+                log(
+                    f"Could not read the saved session from the "
                     f"credential store: {exc}"
                 )
                 return None
@@ -408,9 +407,7 @@ class _SessionStore:
                 else:
                     self._delete(account)
         except Exception as exc:
-            print(
-                f"[KitsuReview] Could not save the session to the credential store: {exc}"
-            )
+            log(f"Could not save the session to the credential store: {exc}")
             return False
         return True
 
@@ -421,9 +418,7 @@ class _SessionStore:
             try:
                 self._delete(self._account(server, email, kind))
             except Exception as exc:
-                print(
-                    f"[KitsuReview] Could not remove a saved session entry: {exc}"
-                )
+                log(f"Could not remove a saved session entry: {exc}")
 
 
 # ----------------------------------------------------------------------
@@ -458,7 +453,7 @@ class RvSession:
         try:
             return rvc.addSourceVerbose([file_path])
         except Exception as exc:
-            print(f"[KitsuReview] Skipped adding source to RV session: {exc}")
+            log(f"Skipped adding source to RV session: {exc}")
             return None
 
     @staticmethod
@@ -473,13 +468,11 @@ class RvSession:
                 if rvc.propertyExists(prop):
                     rvc.setFloatProperty(prop, [float(fps)], True)
             except Exception as exc:
-                print(f"[KitsuReview] Could not set {prop} to {fps}: {exc}")
+                log(f"Could not set {prop} to {fps}: {exc}")
         try:
             rvc.setFPS(float(fps))
         except Exception as exc:
-            print(
-                f"[KitsuReview] Could not set RV playback FPS to {fps}: {exc}"
-            )
+            log(f"Could not set RV playback FPS to {fps}: {exc}")
             return False
         return True
 
@@ -495,9 +488,7 @@ class RvSession:
         try:
             info = rvc.nodeRangeInfo(source_node) or {}
         except Exception as exc:
-            print(
-                f"[KitsuReview] Could not query frame range for {source_node}: {exc}"
-            )
+            log(f"Could not query frame range for {source_node}: {exc}")
             return default
         start = info.get("start") if isinstance(info, dict) else None
         try:
@@ -524,7 +515,7 @@ class RvSession:
         try:
             all_paint = list(rvc.nodesOfType("RVPaint") or [])
         except Exception as exc:
-            print(f"[KitsuReview] Could not query paint nodes: {exc}")
+            log(f"Could not query paint nodes: {exc}")
             return []
 
         own, downstream = [], []
@@ -564,9 +555,7 @@ class RvSession:
         try:
             sources = list(rvc.sourcesAtFrame(rvc.frame()) or [])
         except Exception as exc:
-            print(
-                f"[KitsuReview] Could not query sources at current frame: {exc}"
-            )
+            log(f"Could not query sources at current frame: {exc}")
             return [], []
 
         paint_nodes: List[str] = []
@@ -574,9 +563,7 @@ class RvSession:
             try:
                 group = rvc.nodeGroup(source)
             except Exception as exc:
-                print(
-                    f"[KitsuReview] Could not inspect group of {source}: {exc}"
-                )
+                log(f"Could not inspect group of {source}: {exc}")
                 continue
             for node in self.paint_nodes_for_source(group):
                 if node not in paint_nodes:
@@ -603,6 +590,39 @@ class RvSession:
             color = color[0]
         return [c / 255.0 for c in color]
 
+    def _set_props(self, base, specs):
+        """Write (attribute, type, width, values) specs, in order."""
+        for attr, ptype, width, values in specs:
+            self._set_prop(f"{base}.{attr}", ptype, width, values)
+
+    @staticmethod
+    def _timing_specs(frame, props):
+        return [
+            (
+                "startFrame",
+                rvc.IntType,
+                1,
+                [int(props.get("startFrame", frame))],
+            ),
+            ("duration", rvc.IntType, 1, [int(props.get("duration", 1))]),
+            ("eye", rvc.IntType, 1, [int(props.get("eye", 2))]),
+        ]
+
+    @staticmethod
+    def _uuid_specs(props):
+        if not props.get("uuid"):
+            return []
+        return [("uuid", rvc.StringType, 1, [str(props["uuid"])])]
+
+    @staticmethod
+    def _soft_deleted_spec(props):
+        return (
+            "softDeleted",
+            rvc.IntType,
+            1,
+            [int(props.get("softDeleted", 0))],
+        )
+
     def _write_pen(self, base, frame, props):
         points = props["points"]
 
@@ -612,91 +632,50 @@ class RvSession:
         if len(width) != len(points):
             width = [width[0]] * len(points)
 
-        self._set_prop(
-            f"{base}.color",
-            rvc.FloatType,
-            4,
-            self._color_float(props.get("color")),
+        self._set_props(
+            base,
+            [
+                (
+                    "color",
+                    rvc.FloatType,
+                    4,
+                    self._color_float(props.get("color")),
+                ),
+                ("width", rvc.FloatType, 1, width),
+                ("brush", rvc.StringType, 1, ["circle"]),
+                ("points", rvc.FloatType, 2, [c for xy in points for c in xy]),
+                ("debug", rvc.IntType, 1, [0]),
+                ("join", rvc.IntType, 1, [3]),
+                ("cap", rvc.IntType, 1, [1]),
+                ("splat", rvc.IntType, 1, [0]),
+                # 0 paints, 1 erases what's drawn before it (Kitsu erasers).
+                ("mode", rvc.IntType, 1, [int(props.get("mode") or 0)]),
+                *self._uuid_specs(props),
+            ],
         )
-        self._set_prop(f"{base}.width", rvc.FloatType, 1, width)
-        self._set_prop(f"{base}.brush", rvc.StringType, 1, ["circle"])
-        self._set_prop(
-            f"{base}.points",
-            rvc.FloatType,
-            2,
-            [c for xy in points for c in xy],
-        )
-        self._set_prop(f"{base}.debug", rvc.IntType, 1, [0])
-        self._set_prop(f"{base}.join", rvc.IntType, 1, [3])
-        self._set_prop(f"{base}.cap", rvc.IntType, 1, [1])
-        self._set_prop(f"{base}.splat", rvc.IntType, 1, [0])
-        # 0 paints, 1 erases what's drawn before it (Kitsu erasers).
-        self._set_prop(
-            f"{base}.mode", rvc.IntType, 1, [int(props.get("mode") or 0)]
-        )
-        if props.get("uuid"):
-            self._set_prop(
-                f"{base}.uuid", rvc.StringType, 1, [str(props["uuid"])]
-            )
 
     def _write_box(self, base, frame, props):
         """The same properties RV writes for an ellipse or rect drawn with
         its own annotate tools (see a gathered RV shape in the Dev tab);
         the two share one property set and differ only in the component
         name's "ellipse:"/"rect:" prefix."""
-        self._set_prop(
-            f"{base}.startFrame",
-            rvc.IntType,
-            1,
-            [int(props.get("startFrame", frame))],
+        inner = self._color_float(
+            props.get("innerColor"), default=(255, 255, 255, 0)
         )
-        self._set_prop(
-            f"{base}.duration", rvc.IntType, 1, [int(props.get("duration", 1))]
-        )
-        self._set_prop(
-            f"{base}.eye", rvc.IntType, 1, [int(props.get("eye", 2))]
-        )
-        self._set_prop(
-            f"{base}.min",
-            rvc.FloatType,
-            2,
-            [float(v) for v in props["min"][0]],
-        )
-        self._set_prop(
-            f"{base}.max",
-            rvc.FloatType,
-            2,
-            [float(v) for v in props["max"][0]],
-        )
-        self._set_prop(
-            f"{base}.innerColor",
-            rvc.FloatType,
-            4,
-            self._color_float(
-                props.get("innerColor"), default=(255, 255, 255, 0)
-            ),
-        )
-        self._set_prop(
-            f"{base}.borderColor",
-            rvc.FloatType,
-            4,
-            self._color_float(props.get("borderColor")),
-        )
-        self._set_prop(
-            f"{base}.borderWidth",
-            rvc.FloatType,
-            1,
-            [float(props.get("borderWidth", 0.003))],
-        )
-        if props.get("uuid"):
-            self._set_prop(
-                f"{base}.uuid", rvc.StringType, 1, [str(props["uuid"])]
-            )
-        self._set_prop(
-            f"{base}.softDeleted",
-            rvc.IntType,
-            1,
-            [int(props.get("softDeleted", 0))],
+        border = self._color_float(props.get("borderColor"))
+        border_width = float(props.get("borderWidth", 0.003))
+        self._set_props(
+            base,
+            [
+                *self._timing_specs(frame, props),
+                ("min", rvc.FloatType, 2, [float(v) for v in props["min"][0]]),
+                ("max", rvc.FloatType, 2, [float(v) for v in props["max"][0]]),
+                ("innerColor", rvc.FloatType, 4, inner),
+                ("borderColor", rvc.FloatType, 4, border),
+                ("borderWidth", rvc.FloatType, 1, [border_width]),
+                *self._uuid_specs(props),
+                self._soft_deleted_spec(props),
+            ],
         )
 
     def _write_arrow(self, base, frame, props):
@@ -713,49 +692,22 @@ class RvSession:
         thickness = float(
             props.get("thickness", props.get("borderWidth", 0.003))
         )
-
-        self._set_prop(
-            f"{base}.startFrame",
-            rvc.IntType,
-            1,
-            [int(props.get("startFrame", frame))],
-        )
-        self._set_prop(
-            f"{base}.duration", rvc.IntType, 1, [int(props.get("duration", 1))]
-        )
-        self._set_prop(
-            f"{base}.eye", rvc.IntType, 1, [int(props.get("eye", 2))]
-        )
-        self._set_prop(
-            f"{base}.startPos",
-            rvc.FloatType,
-            2,
-            [float(v) for v in props["startPos"][0]],
-        )
-        self._set_prop(
-            f"{base}.endPos",
-            rvc.FloatType,
-            2,
-            [float(v) for v in props["endPos"][0]],
-        )
-        self._set_prop(f"{base}.borderColor", rvc.FloatType, 4, border)
-        self._set_prop(
-            f"{base}.borderWidth",
-            rvc.FloatType,
-            1,
-            [float(props.get("borderWidth", thickness))],
-        )
-        self._set_prop(f"{base}.innerColor", rvc.FloatType, 4, inner)
-        self._set_prop(f"{base}.thickness", rvc.FloatType, 1, [thickness])
-        if props.get("uuid"):
-            self._set_prop(
-                f"{base}.uuid", rvc.StringType, 1, [str(props["uuid"])]
-            )
-        self._set_prop(
-            f"{base}.softDeleted",
-            rvc.IntType,
-            1,
-            [int(props.get("softDeleted", 0))],
+        border_width = float(props.get("borderWidth", thickness))
+        start = [float(v) for v in props["startPos"][0]]
+        end = [float(v) for v in props["endPos"][0]]
+        self._set_props(
+            base,
+            [
+                *self._timing_specs(frame, props),
+                ("startPos", rvc.FloatType, 2, start),
+                ("endPos", rvc.FloatType, 2, end),
+                ("borderColor", rvc.FloatType, 4, border),
+                ("borderWidth", rvc.FloatType, 1, [border_width]),
+                ("innerColor", rvc.FloatType, 4, inner),
+                ("thickness", rvc.FloatType, 1, [thickness]),
+                *self._uuid_specs(props),
+                self._soft_deleted_spec(props),
+            ],
         )
 
     def _write_text(self, base, frame, props):
@@ -771,96 +723,47 @@ class RvSession:
         font_size = float(props.get("fontSize", 0.05))
         size = float(props.get("size", font_size / scale / 12.5))
 
-        self._set_prop(
-            f"{base}.position",
-            rvc.FloatType,
-            2,
-            [float(v) for v in position[:2]],
-        )
-        self._set_prop(
-            f"{base}.color",
-            rvc.FloatType,
-            4,
-            self._color_float(props.get("color")),
-        )
-        self._set_prop(
-            f"{base}.spacing",
-            rvc.FloatType,
-            1,
-            [float(props.get("spacing", 0.8))],
-        )
-        self._set_prop(f"{base}.size", rvc.FloatType, 1, [size])
-        self._set_prop(f"{base}.scale", rvc.FloatType, 1, [scale])
-        self._set_prop(
-            f"{base}.rotation",
-            rvc.FloatType,
-            1,
-            [float(props.get("rotation", 0.0))],
-        )
-        self._set_prop(
-            f"{base}.font", rvc.StringType, 1, [str(props.get("font", ""))]
-        )
-        self._set_prop(
-            f"{base}.text", rvc.StringType, 1, [str(props.get("text", ""))]
-        )
-        self._set_prop(
-            f"{base}.origin", rvc.StringType, 1, [str(props.get("origin", ""))]
-        )
-        self._set_prop(
-            f"{base}.debug", rvc.IntType, 1, [int(props.get("debug", 0))]
-        )
-        self._set_prop(
-            f"{base}.startFrame",
-            rvc.IntType,
-            1,
-            [int(props.get("startFrame", frame))],
-        )
-        self._set_prop(
-            f"{base}.duration", rvc.IntType, 1, [int(props.get("duration", 1))]
-        )
-        self._set_prop(
-            f"{base}.mode", rvc.IntType, 1, [int(props.get("mode", 0))]
-        )
-        self._set_prop(
-            f"{base}.fontFamily",
-            rvc.StringType,
-            1,
-            [str(props.get("fontFamily", ""))],
-        )
-        self._set_prop(f"{base}.fontSize", rvc.FloatType, 1, [font_size])
-        self._set_prop(
-            f"{base}.fontWeight",
-            rvc.StringType,
-            1,
-            [str(props.get("fontWeight", "normal"))],
-        )
-        self._set_prop(
-            f"{base}.fontStyle",
-            rvc.StringType,
-            1,
-            [str(props.get("fontStyle", "normal"))],
-        )
-        self._set_prop(
-            f"{base}.textDecoration",
-            rvc.StringType,
-            1,
-            [str(props.get("textDecoration", "none"))],
-        )
-        self._set_prop(
-            f"{base}.textAlign",
-            rvc.StringType,
-            1,
-            [str(props.get("textAlign", "left"))],
-        )
-        if props.get("uuid"):
-            self._set_prop(
-                f"{base}.uuid", rvc.StringType, 1, [str(props["uuid"])]
-            )
-        self._set_prop(
-            f"{base}.softDeleted",
-            rvc.IntType,
-            1,
-            [int(props.get("softDeleted", 0))],
+        def text_spec(attr, default):
+            return (attr, rvc.StringType, 1, [str(props.get(attr, default))])
+
+        def number_spec(attr, ptype, cast, default):
+            return (attr, ptype, 1, [cast(props.get(attr, default))])
+
+        self._set_props(
+            base,
+            [
+                (
+                    "position",
+                    rvc.FloatType,
+                    2,
+                    [float(v) for v in position[:2]],
+                ),
+                (
+                    "color",
+                    rvc.FloatType,
+                    4,
+                    self._color_float(props.get("color")),
+                ),
+                number_spec("spacing", rvc.FloatType, float, 0.8),
+                ("size", rvc.FloatType, 1, [size]),
+                ("scale", rvc.FloatType, 1, [scale]),
+                number_spec("rotation", rvc.FloatType, float, 0.0),
+                text_spec("font", ""),
+                text_spec("text", ""),
+                text_spec("origin", ""),
+                number_spec("debug", rvc.IntType, int, 0),
+                number_spec("startFrame", rvc.IntType, int, frame),
+                number_spec("duration", rvc.IntType, int, 1),
+                number_spec("mode", rvc.IntType, int, 0),
+                text_spec("fontFamily", ""),
+                ("fontSize", rvc.FloatType, 1, [font_size]),
+                text_spec("fontWeight", "normal"),
+                text_spec("fontStyle", "normal"),
+                text_spec("textDecoration", "none"),
+                text_spec("textAlign", "left"),
+                *self._uuid_specs(props),
+                self._soft_deleted_spec(props),
+            ],
         )
 
     _SHAPE_WRITERS = {
@@ -883,10 +786,9 @@ class RvSession:
             kind = shape.get("type")
             writer = self._SHAPE_WRITERS.get(kind)
             if writer is None:
-                print(
-                    f"[KitsuReview] Live-apply: skipping unsupported shape "
+                log(
+                    f"Live-apply: skipping unsupported shape "
                     f"type {kind!r}",
-                    file=sys.stderr,
                 )
                 continue
 
@@ -921,12 +823,43 @@ class RvSession:
 
         if ptype == rvc.FloatType:
             return rvc.getFloatProperty(prop)
-        elif ptype == rvc.IntType:
+        if ptype == rvc.IntType:
             return rvc.getIntProperty(prop)
-        elif ptype == rvc.StringType:
+        if ptype == rvc.StringType:
             return rvc.getStringProperty(prop)
-        else:
-            return None
+        return None
+
+    @classmethod
+    def _shaped_value(cls, attr, value):
+        """A raw flat property value as the shape dicts hold it: grouped
+        (points, colors, ...), or unwrapped when it's a single value."""
+        if not isinstance(value, list):
+            return value
+        group_size = cls._GROUPED_KEYS.get(attr)
+        if group_size and value and len(value) % group_size == 0:
+            return [
+                list(value[i : i + group_size])
+                for i in range(0, len(value), group_size)
+            ]
+        return value[0] if len(value) == 1 else value
+
+    def _shape_properties(self, node, item_name, all_props):
+        prefix = f"{node}.{item_name}."
+        return {
+            p[len(prefix) :]: self._shaped_value(
+                p[len(prefix) :], self._property_value(p)
+            )
+            for p in all_props
+            if p.startswith(prefix)
+        }
+
+    @staticmethod
+    def _frame_order(prop):
+        try:
+            order = rvc.getStringProperty(prop)
+        except Exception:
+            return []
+        return [order] if isinstance(order, str) else order
 
     def gather_annotations(self, paint_nodes=None):
         """Read annotation shapes out of RV paint nodes.
@@ -947,70 +880,30 @@ class RvSession:
                     rvc.nodesOfType("RVPaint") or []
                 )
             except Exception as exc:
-                print(f"[KitsuReview] Could not query paint nodes: {exc}")
+                log(f"Could not query paint nodes: {exc}")
                 return annotations
 
         for node in paint_nodes:
             try:
                 all_props = rvc.properties(node)
             except Exception as exc:
-                print(f"[KitsuReview] Skipped paint node {node}: {exc}")
+                log(f"Skipped paint node {node}: {exc}")
                 continue
 
             for prop in all_props:
                 match = _FRAME_ORDER_RE.search(prop)
                 if not match:
                     continue
-                frame = int(match.group(1))
-
-                try:
-                    order = rvc.getStringProperty(prop)
-                except Exception:
-                    order = []
-
-                if isinstance(order, str):
-                    order = [order]
-                if not order:
-                    continue
-
-                for item_name in order:
-                    kind = (
-                        item_name.split(":")[0]
-                        if ":" in item_name
-                        else item_name
-                    )
-                    item_prefix = f"{node}.{item_name}."
-
-                    properties = {}
-                    for p in all_props:
-                        if not p.startswith(item_prefix):
-                            continue
-                        attr = p[len(item_prefix) :]
-                        value = self._property_value(p)
-
-                        group_size = self._GROUPED_KEYS.get(attr)
-                        if (
-                            group_size
-                            and isinstance(value, list)
-                            and len(value) % group_size == 0
-                            and len(value) > 0
-                        ):
-                            value = [
-                                list(value[i : i + group_size])
-                                for i in range(0, len(value), group_size)
-                            ]
-                        elif isinstance(value, list) and len(value) == 1:
-                            value = value[0]
-
-                        properties[attr] = value
-
+                for item_name in self._frame_order(prop) or []:
                     annotations.append(
                         {
-                            "frame": frame,
+                            "frame": int(match.group(1)),
                             "node": node,
                             "name": item_name,
-                            "type": kind,
-                            "properties": properties,
+                            "type": item_name.split(":")[0],
+                            "properties": self._shape_properties(
+                                node, item_name, all_props
+                            ),
                         }
                     )
 
@@ -1029,7 +922,7 @@ class KitsuReviewModel:
 
     Methods raise on failures the user needs to hear about and leave the
     reporting to the view; failures that are only worth a log line are
-    printed here and swallowed, as before.
+    printed here and swallowed.
     """
 
     def __init__(self):
@@ -1115,9 +1008,7 @@ class KitsuReviewModel:
         try:
             gazu.log_out()
         except Exception as exc:
-            print(
-                f"[KitsuReview] gazu.log_out() failed (continuing anyway): {exc}"
-            )
+            log(f"gazu.log_out() failed (continuing anyway): {exc}")
         self.logged_in = False
         self.current_user = None
         self._session_server = self._session_email = None
@@ -1163,9 +1054,7 @@ class KitsuReviewModel:
         try:
             tokens = _current_gazu_tokens()
         except Exception as exc:
-            print(
-                f"[KitsuReview] Could not read the current gazu session tokens: {exc}"
-            )
+            log(f"Could not read the current gazu session tokens: {exc}")
             return
         # Keep only what we store, so the "unchanged?" check is stable.
         tokens = {
@@ -1246,9 +1135,7 @@ class KitsuReviewModel:
             self._reset_gazu_tokens()
             raise
         except Exception as exc:
-            print(
-                f"[KitsuReview] Could not restore the saved Kitsu session: {exc}"
-            )
+            log(f"Could not restore the saved Kitsu session: {exc}")
             self._reset_gazu_tokens()
             raise
 
@@ -1310,17 +1197,16 @@ class KitsuReviewModel:
                 try:
                     entity = gazu.entity.get_entity(entity_id) or {}
                 except Exception as exc:
-                    print(
-                        f"[KitsuReview] Could not fetch entity {entity_id}: {exc}"
-                    )
+                    log(f"Could not fetch entity {entity_id}: {exc}")
 
             try:
                 previews = (
                     gazu.files.get_all_preview_files_for_task(task) or []
                 )
             except Exception as exc:
-                print(
-                    f"[KitsuReview] Could not fetch previews for task {task.get('id')}: {exc}"
+                log(
+                    f"Could not fetch previews for task {task.get('id')}: "
+                    f"{exc}"
                 )
                 previews = []
 
@@ -1429,8 +1315,8 @@ class KitsuReviewModel:
                     break
                 batch = gazu.playlist.all_playlists_for_project(project) or []
             except Exception as exc:
-                print(
-                    f"[KitsuReview] Could not fetch playlists for project "
+                log(
+                    f"Could not fetch playlists for project "
                     f"{project.get('name')!r}: {exc}"
                 )
                 break
@@ -1458,8 +1344,8 @@ class KitsuReviewModel:
                     or []
                 )
             except Exception as exc:
-                print(
-                    f"[KitsuReview] Could not fetch tasks awaiting review for "
+                log(
+                    f"Could not fetch tasks awaiting review for "
                     f"project {project_id}: {exc}"
                 )
                 return None
@@ -1478,9 +1364,7 @@ class KitsuReviewModel:
             try:
                 playlist = gazu.playlist.get_playlist(light["id"]) or light
             except Exception as exc:
-                print(
-                    f"[KitsuReview] Could not fetch playlist {light.get('name')!r}: {exc}"
-                )
+                log(f"Could not fetch playlist {light.get('name')!r}: {exc}")
                 return None
             entries = playlist.get("shots") or []
         entries = [e for e in entries if isinstance(e, dict)]
@@ -1516,9 +1400,6 @@ class KitsuReviewModel:
             "pending_exact": False,
         }
 
-    def playlist_loaded(self, summary):
-        return summary["id"] in self._playlist_revisions
-
     def load_playlist_revisions(self, summary):
         """The revisions a playlist puts up for review, in playlist order
         (cached until the next playlist refresh). Returns (revisions,
@@ -1551,8 +1432,8 @@ class KitsuReviewModel:
                 gazu.task.get_task(preview_file["task_id"])
             )
         except Exception as exc:
-            print(
-                f"[KitsuReview] Skipped playlist entry {entry.get('entity_id')} "
+            log(
+                f"Skipped playlist entry {entry.get('entity_id')} "
                 f"(preview {preview_id}): {exc}"
             )
             return None
@@ -1577,9 +1458,7 @@ class KitsuReviewModel:
             try:
                 name = person_display_name(gazu.person.get_person(person_id))
             except Exception as exc:
-                print(
-                    f"[KitsuReview] Could not fetch person {person_id}: {exc}"
-                )
+                log(f"Could not fetch person {person_id}: {exc}")
                 name = "Unknown"
             self._person_cache[person_id] = name
         return self._person_cache[person_id]
@@ -1623,8 +1502,8 @@ class KitsuReviewModel:
             if response.ok:
                 data = response.content
         except Exception as exc:
-            print(
-                f"[KitsuReview] Could not fetch thumbnail for preview "
+            log(
+                f"Could not fetch thumbnail for preview "
                 f"{preview_file_id}: {exc}"
             )
 
@@ -1642,7 +1521,7 @@ class KitsuReviewModel:
         try:
             statuses = gazu.task.all_task_statuses() or []
         except Exception as exc:
-            print(f"[KitsuReview] Could not fetch task statuses: {exc}")
+            log(f"Could not fetch task statuses: {exc}")
             return
         self._task_statuses = {s["id"]: s for s in statuses if s.get("id")}
 
@@ -1652,7 +1531,7 @@ class KitsuReviewModel:
         try:
             task_types = gazu.task.all_task_types() or []
         except Exception as exc:
-            print(f"[KitsuReview] Could not fetch task types: {exc}")
+            log(f"Could not fetch task types: {exc}")
             return
         self._task_types = {t["id"]: t for t in task_types if t.get("id")}
 
@@ -1676,9 +1555,7 @@ class KitsuReviewModel:
             try:
                 project = gazu.project.get_project(project_id) or None
             except Exception as exc:
-                print(
-                    f"[KitsuReview] Could not fetch project {project_id}: {exc}"
-                )
+                log(f"Could not fetch project {project_id}: {exc}")
                 project = None
             self._project_cache[project_id] = project
         return self._project_cache[project_id]
@@ -1695,9 +1572,10 @@ class KitsuReviewModel:
         project = self._project(project_id) or {}
         fps = _parse_fps(project.get("fps"))
         if fps is None:
-            print(
-                f"[KitsuReview] Project {project.get('name') or project_id!r} has no "
-                f"usable FPS ({project.get('fps')!r}); using {format_fps(DEFAULT_FPS)}."
+            log(
+                f"Project {project.get('name') or project_id!r} has no "
+                f"usable FPS ({project.get('fps')!r}); using "
+                f"{format_fps(DEFAULT_FPS)}."
             )
             return DEFAULT_FPS, False
         return fps, True
@@ -1851,9 +1729,7 @@ class KitsuReviewModel:
             try:
                 rev["source_group"] = rvc.nodeGroup(source_node)
             except Exception as exc:
-                print(
-                    f"[KitsuReview] Could not find the group of {source_node}: {exc}"
-                )
+                log(f"Could not find the group of {source_node}: {exc}")
 
         is_still = _is_still(preview_file)
         base_frame = (
@@ -1872,9 +1748,7 @@ class KitsuReviewModel:
             rev["width"] = rev["height"] = None
             openrv_annotations = []
             skipped = True
-            print(
-                f"[KitsuReview] {exc} Existing annotations will not be loaded."
-            )
+            log(f"{exc} Existing annotations will not be loaded.")
         else:
             rev["width"], rev["height"] = width, height
             openrv_annotations = convertToORV(
@@ -1943,21 +1817,12 @@ class KitsuReviewModel:
             return None
         return self.rv.paint_nodes_for_source(source_group) or None
 
-    @staticmethod
-    def _push_to_kitsu(preview_file, additions, updates, deletions):
-        return gazu.files.update_preview_annotations(
-            preview_file,
-            additions=additions,
-            updates=updates,
-            deletions=deletions,
-        )
-
     def export_annotations(self, rev, fallback_comment_count=0):
         """Send every paint node's annotations to the revision's preview
         file on Kitsu: new objects as additions, existing ones that changed
         (e.g. erased in RV) as updates, since Kitsu ignores an addition
-        whose id it already has. Returns {"n_comments", "frames_note",
-        "n_added", "n_updated"} for the summary. Raises
+        whose id it already has. Returns {"n_comments", "frames_note"} for
+        the summary. Raises
         DimensionsUnknownError if the size is unknown, or the server's
         error if the push fails."""
         try:
@@ -1965,27 +1830,30 @@ class KitsuReviewModel:
                 gazu.task.all_comments_for_task(rev["task"]) or []
             )
         except Exception as exc:
-            print(
-                f"[KitsuReview] Could not fetch comment count for export summary: {exc}"
-            )
+            log(f"Could not fetch comment count for export summary: {exc}")
             n_comments = fallback_comment_count
 
         annotations = self.rv.gather_annotations(self.export_paint_nodes(rev))
         annotated_frames = sorted({a["frame"] for a in annotations})
         if annotated_frames:
-            frames_note = f"{len(annotated_frames)} annotated frame(s): {annotated_frames}"
+            frames_note = (
+                f"{len(annotated_frames)} annotated frame(s): "
+                f"{annotated_frames}"
+            )
         else:
             frames_note = "0 annotated frames"
 
-        self.resolve_dimensions(rev)
         records = self.kitsu_records_for(rev, annotations)
         preview_file = rev["preview_file"]
         additions, updates = split_annotation_changes(
             records, preview_file.get("annotations")
         )
         if additions or updates:
-            result = self._push_to_kitsu(
-                preview_file["id"], additions, updates, []
+            result = gazu.files.update_preview_annotations(
+                preview_file["id"],
+                additions=additions,
+                updates=updates,
+                deletions=[],
             )
             # Match the next export against what Kitsu now stores, not
             # against what it had when the revision list was loaded.
@@ -1994,15 +1862,7 @@ class KitsuReviewModel:
             ):
                 preview_file["annotations"] = result["annotations"]
 
-        def count(groups):
-            return sum(len(g["drawing"]["objects"]) for g in groups)
-
-        return {
-            "n_comments": n_comments,
-            "frames_note": frames_note,
-            "n_added": count(additions),
-            "n_updated": count(updates),
-        }
+        return {"n_comments": n_comments, "frames_note": frames_note}
 
     # ------------------------------------------------------------------
     # Dev view
@@ -2034,9 +1894,8 @@ class KitsuReviewModel:
         try:
             payload, status = self._dev_payload(view, current_source_only)
         except Exception as exc:
-            payload, status = {
-                "error": f"{type(exc).__name__}: {exc}"
-            }, "Error building view"
+            payload = {"error": f"{type(exc).__name__}: {exc}"}
+            status = "Error building view"
         return json.dumps(payload, indent=2, default=_json_default), status
 
     def _dev_payload(self, view, current_source_only):
@@ -2106,7 +1965,10 @@ class KitsuReviewModel:
             "record_count": len(records or []),
             "records": records,
         }
-        status = f"{len(records or [])} Kitsu record(s) from {len(annotations)} RV shape(s)"
+        status = (
+            f"{len(records or [])} Kitsu record(s) from {len(annotations)} "
+            f"RV shape(s)"
+        )
         return payload, status
 
     def _dev_server_payload(self):
@@ -2124,8 +1986,9 @@ class KitsuReviewModel:
             fresh = gazu.files.get_preview_file(preview_file["id"]) or {}
             annotations = fresh.get("annotations")
         except Exception as exc:
-            print(
-                f"[KitsuReview] Could not re-fetch preview file {preview_file.get('id')}: {exc}"
+            log(
+                f"Could not re-fetch preview file {preview_file.get('id')}: "
+                f"{exc}"
             )
             annotations = preview_file.get("annotations")
             source = (
