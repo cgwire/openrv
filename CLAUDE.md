@@ -68,11 +68,22 @@ Python runs inside OpenRV's bundled interpreter, and no version is pinned here: 
 
 ## Testing
 
-There is no automated suite and no linter in CI.
+CI runs no tests and no linter: run them yourself.
 
-- `test/annotation_image.py` and `test/annotation_video.py` are manual scripts that dump annotations from a live Kitsu into JSON fixtures. Don't add credentials to them.
+```bash
+pip install PySide6-Essentials
+
+python -m unittest discover -s test
+
+# After an intended change of behaviour: read the diff first, then update it
+UPDATE_SNAPSHOT=1 python -m unittest discover -s test
+```
+
+- `test/test_behaviour.py` runs `test/behaviour_scenario.py` and compares its output with `test/behaviour.expected.txt`. The scenario drives the real converter, model and Qt panel (offscreen), with `rv`, `gazu`, `requests` and `keyring` stubbed. Linux only.
+- Add a scenario step when you add behaviour. Never update the snapshot to make a failure go away without reading the diff.
+- The stubs prove the plugin calls `rv` and `gazu` the same way as before, not that those calls are right. Paint-node and viewport changes still need a check inside OpenRV: say so when you could not run it.
+- `test/annotation_image.py` and `test/annotation_video.py` are manual scripts that dump annotations from a live Kitsu into JSON fixtures. They read `KITSU_EMAIL` and `KITSU_PASSWORD` from the environment: don't add credentials to them.
 - Check converter changes with the CLI on a real dump.
-- Panel and paint-node changes can only be checked inside OpenRV: say so when you could not run them.
 
 ## Packaging & Release
 
