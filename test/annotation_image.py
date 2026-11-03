@@ -4,16 +4,18 @@ Load the annotations of the task of the shot that has the status WFA
 Store the annotations in test_image.json.
 
 Requires: pip install gazu
+Set KITSU_EMAIL and KITSU_PASSWORD. KITSU_API is optional.
 """
 
 import json
+import os
 import sys
 
 import gazu
 
-KITSU_API = "http://localhost/api"
-EMAIL = "basile@cg-wire.com"
-PASSWORD = "mysecretpassword"
+KITSU_API = os.environ.get("KITSU_API", "http://localhost/api")
+EMAIL = os.environ["KITSU_EMAIL"]
+PASSWORD = os.environ["KITSU_PASSWORD"]
 
 # From: /productions/<project_id>/episodes/<episode_id>/shots/<shot_id>
 SHOT_ID = "9077f083-ed4b-46c2-9c9a-8130d927bbc4"

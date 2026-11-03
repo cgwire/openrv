@@ -4,15 +4,17 @@ from Kitsu.
 Store the annotations in test_video.json.
 
 Requires: pip install gazu
+Set KITSU_EMAIL and KITSU_PASSWORD. KITSU_API is optional.
 """
 
 import json
+import os
 
 import gazu
 
-HOST = "http://localhost/api"
-EMAIL = "basile@cg-wire.com"
-PASSWORD = "mysecretpassword"
+HOST = os.environ.get("KITSU_API", "http://localhost/api")
+EMAIL = os.environ["KITSU_EMAIL"]
+PASSWORD = os.environ["KITSU_PASSWORD"]
 
 PROJECT_ID = "5b388012-7bda-4b97-a7be-9702e10a2968"
 EPISODE_ID = "640f4073-f138-47ac-bed9-43106fd90510"

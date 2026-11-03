@@ -53,6 +53,10 @@ def _wait_cursor():
         QtWidgets.QApplication.restoreOverrideCursor()
 
 
+def _escaped(value):
+    return html.escape(str(value))
+
+
 def _revision_label(rev):
     return f"v{rev['revision']:03d}"
 
@@ -143,6 +147,7 @@ class KitsuReviewPanel(_QWidgetBase):
         top_bar = QtWidgets.QHBoxLayout()
         self.status_label = QtWidgets.QLabel("Not connected to Kitsu")
         self.status_label.setStyleSheet("font-weight: bold;")
+        self.status_label.setTextFormat(QtCore.Qt.PlainText)
         top_bar.addWidget(self.status_label)
         top_bar.addStretch()
 
@@ -294,6 +299,8 @@ class KitsuReviewPanel(_QWidgetBase):
         label = QtWidgets.QLabel("")
         label.setWordWrap(True)
         label.setStyleSheet("color: #888;")
+        # The text holds names from Kitsu, which are not markup.
+        label.setTextFormat(QtCore.Qt.PlainText)
         return label
 
     def _build_playlists_tab(self):
@@ -1076,28 +1083,28 @@ class KitsuReviewPanel(_QWidgetBase):
             color = _status_qcolor(status).name()
             status_html = (
                 f"<span style='background-color: {color}; color: #111; "
-                f"padding: 0 "
-                f"4px;'>&nbsp;{status_short_label(status)}&nbsp;</span> "
-                f"{rev['status']}"
+                f"padding: 0 4px;'>"
+                f"&nbsp;{_escaped(status_short_label(status))}&nbsp;</span> "
+                f"{_escaped(rev['status'])}"
             )
         else:
-            status_html = str(rev["status"])
+            status_html = _escaped(rev["status"])
         fps_html = f"{format_fps(rev.get('fps'))} fps"
         if not rev.get("fps_from_project"):
             fps_html += " <i>(default; production FPS not set in Kitsu)</i>"
         playlist = self.model.playlist_for_revision(rev)
         playlist_html = (
-            f" &nbsp;|&nbsp; Playlist: {html.escape(playlist['name'])}"
+            f" &nbsp;|&nbsp; Playlist: {_escaped(playlist['name'])}"
             if playlist
             else ""
         )
         self.detail_label.setText(
-            f"<b>{rev['shot']}</b> &nbsp;|&nbsp; {rev['task_type']} "
-            f"&nbsp;|&nbsp; "
-            f"Revision v{rev['revision']:03d} &nbsp;|&nbsp; Status: "
+            f"<b>{_escaped(rev['shot'])}</b> &nbsp;|&nbsp; "
+            f"{_escaped(rev['task_type'])} &nbsp;|&nbsp; "
+            f"Revision {_revision_label(rev)} &nbsp;|&nbsp; Status: "
             f"{status_html}"
-            f"<br>Artist: {rev['artist']} &nbsp;|&nbsp; Submitted: "
-            f"{rev['date']}"
+            f"<br>Artist: {_escaped(rev['artist'])} &nbsp;|&nbsp; Submitted: "
+            f"{_escaped(rev['date'])}"
             f" &nbsp;|&nbsp; FPS: {fps_html}{playlist_html}"
         )
 
@@ -1235,7 +1242,18 @@ class KitsuReviewPanel(_QWidgetBase):
         progress.setValue(100)
         progress.close()
 
-        if self.model.load_into_rv(rev, file_path):
+        try:
+            annotations_skipped = self.model.load_into_rv(rev, file_path)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Kitsu",
+                f"The revision is downloaded to {file_path}, but it could "
+                f"not be loaded into RV: {exc}",
+            )
+            return
+
+        if annotations_skipped:
             QtWidgets.QMessageBox.warning(
                 self,
                 "Kitsu",
@@ -1285,15 +1303,22 @@ class KitsuReviewPanel(_QWidgetBase):
 
         self._refresh_dev_view_if_active()
 
+        n_added, n_updated = summary["n_added"], summary["n_updated"]
+        outcome = (
+            f"Export complete: {n_added} object(s) added, "
+            f"{n_updated} updated."
+            if n_added or n_updated
+            else "Nothing to export: Kitsu already has these annotations."
+        )
         QtWidgets.QMessageBox.information(
             self,
             "Kitsu",
-            "Export complete!\n\n"
+            f"{outcome}\n\n"
             f"Shot: {rev['shot']}\n"
             f"Task: {rev['task_type']}\n"
             f"Revision: v{rev['revision']:03d}\n"
             f"Comments on Kitsu: {summary['n_comments']}\n"
-            f"Annotations exported: {summary['frames_note']}",
+            f"Annotations in RV: {summary['frames_note']}",
         )
 
 
