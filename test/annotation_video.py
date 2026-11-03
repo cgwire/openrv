@@ -1,16 +1,20 @@
 """
-Load the annotations of the WFA (Waiting For Approval) task(s) of a shot
-from Kitsu and store them in test_video.json.
+Load the annotations of the WFA (Waiting For Approval) tasks of a shot
+from Kitsu.
+Store the annotations in test_video.json.
 
 Requires: pip install gazu
+Set KITSU_EMAIL and KITSU_PASSWORD. KITSU_API is optional.
 """
+
 import json
+import os
 
 import gazu
 
-HOST = "http://localhost/api"
-EMAIL = "basile@cg-wire.com"
-PASSWORD = "mysecretpassword"
+HOST = os.environ.get("KITSU_API", "http://localhost/api")
+EMAIL = os.environ["KITSU_EMAIL"]
+PASSWORD = os.environ["KITSU_PASSWORD"]
 
 PROJECT_ID = "5b388012-7bda-4b97-a7be-9702e10a2968"
 EPISODE_ID = "640f4073-f138-47ac-bed9-43106fd90510"
@@ -20,7 +24,9 @@ OUTPUT_FILE = "test_video.json"
 
 
 def get_wfa_status():
-    """Return the task status whose short name is WFA (case-insensitive)."""
+    """
+    Return the task status that has the short name WFA (case-insensitive).
+    """
     for status in gazu.task.all_task_statuses():
         if status["short_name"].lower() == "wfa":
             return status
@@ -28,11 +34,15 @@ def get_wfa_status():
 
 
 def get_task_annotations(task):
-    """Collect annotations from every preview attached to the task's comments."""
+    """
+    Get the annotations of each preview in the comments of the task.
+    """
     previews = []
     for comment in gazu.task.all_comments_for_task(task):
         for preview in comment.get("previews", []):
-            preview_id = preview["id"] if isinstance(preview, dict) else preview
+            preview_id = (
+                preview["id"] if isinstance(preview, dict) else preview
+            )
             preview_file = gazu.files.get_preview_file(preview_id)
             previews.append(
                 {

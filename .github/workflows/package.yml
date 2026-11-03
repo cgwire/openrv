@@ -26,7 +26,7 @@ jobs:
           echo "Building version $version"
 
       - name: Build package
-        run: zip -r kitsu-${{ steps.vars.outputs.version }}.rvpkg ./src/PACKAGE ./src/kitsu.py
+        run: zip -r kitsu-${{ steps.vars.outputs.version }}.rvpkg ./src/PACKAGE ./src/*.py
 
       - uses: actions/upload-artifact@v4
         with:

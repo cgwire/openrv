@@ -75,16 +75,19 @@ It can auto-refresh every second and copy the JSON to the clipboard.
 
 ## Development
 
-The plugin is split in three modules:
+The plugin is split in these modules:
 
 - `kitsu.py`: the panel UI and the RV mode that docks it.
-- `kitsu_review_model.py`: Kitsu (gazu), session persistence, status rules and RV paint-node reading/writing.
+- `kitsu_review_model.py`: Kitsu (gazu) calls and status rules.
+- `kitsu_session_store.py`: session persistence (QSettings and the credential store).
+- `kitsu_rv_session.py`: RV sources and paint-node reading/writing.
+- `kitsu_review_log.py`: log messages.
 - `annotation_converter.py`: pure-Python Kitsu ↔ OpenRV annotation conversion, with no OpenRV, Qt or gazu dependency.
 
 1. Package the plugin for OpenRV:
 
 ```bash
-zip -r kitsu-1.0.rvpkg ./src/PACKAGE ./src/kitsu.py ./src/kitsu_review_model.py ./src/annotation_converter.py
+zip -r kitsu-1.0.rvpkg ./src/PACKAGE ./src/*.py
 ```
 
 2. Install the package in `OpenRV > Preferences > Packages > Add Packages` or use the OpenRV CLI:

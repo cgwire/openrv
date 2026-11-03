@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
-"""Kitsu <-> OpenRV annotation conversion.
+"""
+Convert annotations between Kitsu and OpenRV.
 
-Pure Python with no OpenRV, Qt or gazu dependency, so it can be unit
-tested and run standalone (see the CLI at the bottom).
+This module is pure Python. It has no OpenRV, Qt or gazu dependency.
+So you can unit test it and run it alone (see the CLI at the bottom).
 
 Public API:
-    convertToKitsu(openrv_shapes, width, height, ...) -> Kitsu annotation records
-    convertToORV(kitsu_records, width, height, ...)   -> OpenRV paint shapes
+    convertToKitsu(openrv_shapes, width, height, ...) -> Kitsu records
+    convertToORV(kitsu_records, width, height, ...)   -> OpenRV shapes
     split_annotation_changes(records, reference)      -> (additions, updates)
 
-Erasers work differently on the two sides. In RV an eraser is a pen with
-mode 1 that clears everything drawn before it on its frame. In Kitsu
-(Fabric.js) an eraser stroke is stored on each object it erased, as a
-path inside that object's "eraser" group, and later objects aren't
-affected. The converters translate between the two (see "Erasers").
+Erasers work in different ways on the two sides. In RV, an eraser is a pen with
+mode 1. It clears everything drawn before it on its frame.
+
+In Kitsu (Fabric.js), the eraser stroke is stored on each object that it
+erased. It is a path in the "eraser" group of that object. Later objects are
+not affected.
+
+The converters translate between the two (see "Erasers").
 """
 
 from __future__ import annotations
 
+import argparse
 import copy
 import datetime as _dt
 import heapq
@@ -27,12 +32,14 @@ import re
 import sys
 import time as _time
 import uuid
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 __all__ = [
-    "convertToKitsu", "convertToORV", "extract_authors", "build_paint_gto",
-    "shapes_to_paint_gto", "frame_to_time", "time_to_frame",
-    "frame_to_time_ms", "time_ms_to_frame", "split_annotation_changes",
+    "convertToKitsu",
+    "convertToORV",
+    "frame_to_time",
+    "time_to_frame",
+    "split_annotation_changes",
     "DEFAULT_FPS",
 ]
 
@@ -40,85 +47,87 @@ Point = Tuple[float, float]
 
 MS_PER_STROKE_POINT = 8
 
-# Fabric.js version Kitsu currently writes into annotation objects.
+# Fabric.js version that Kitsu writes now in annotation objects.
 FABRIC_VERSION = "7.4.0"
 
-# How close (canvas px) a converted stroke must be to an existing Kitsu
-# stroke to be treated as the same, unchanged stroke.
+# Distance limit (canvas px). A converted stroke that is this close to a Kitsu
+# stroke is the same, unchanged stroke.
 MATCH_TOLERANCE_PX = 0.05
 
-# Kitsu draws ellipses as Fabric.js "circle" objects, stretched with
-# scaleX/scaleY when they aren't round. Fabric's own "ellipse" class is
-# read as well.
+# Kitsu draws ellipses as Fabric.js "circle" objects. When the ellipse is not
+# round, Kitsu stretches the circle with scaleX/scaleY. The code also reads the
+# "ellipse" class of Fabric.
 KITSU_ELLIPSE_TYPES = ("circle", "ellipse")
 
-# Kitsu rectangles are Fabric.js "rect" objects. Fabric's rx/ry on a rect
-# are corner radii, which RV rects don't have.
+# Kitsu rectangles are Fabric.js "rect" objects. The rx/ry fields of Fabric on
+# a rect are corner radii. RV rects do not have corner radii.
 KITSU_RECT_TYPES = ("rect",)
 
-# Kitsu arrows are a Fabric.js Line subclass ("arrow"): x1/y1 is the tail,
-# x2/y2 the head, plus a head size/width in canvas px. RV arrows have no
-# separate head size (it follows the line thickness), so arrows coming
-# from RV get the head Kitsu draws by default.
+# Kitsu arrows are a Fabric.js Line subclass ("arrow"). x1/y1 is the tail and
+# x2/y2 is the head. The object also has a head size and a head width in canvas
+# px. In RV, the head size follows the line thickness, so RV arrows have no
+# separate head size. Arrows from RV get the head that Kitsu draws by default.
 KITSU_ARROW_HEAD_SIZE = 15
 KITSU_ARROW_HEAD_WIDTH = 12
 
-# Kitsu text is a Fabric.js "i-text" ("text" and "textbox" are read too).
-# Its color is the "fill", its fontSize is in canvas px, and Kitsu always
-# draws it in Arial on a translucent white background.
+# Kitsu text is a Fabric.js "i-text". The code also reads "text" and "textbox".
+# The color is the "fill" and the fontSize is in canvas px. Kitsu always draws
+# text in Arial on a translucent white background.
 KITSU_TEXT_TYPES = ("i-text", "text", "textbox")
 KITSU_TEXT_FONT_FAMILY = "arial"
 KITSU_TEXT_LINE_HEIGHT = 1.16
 KITSU_TEXT_BACKGROUND = "rgba(255,255,255, 0.8)"
 
-# Fabric.js text metrics (FabricText._fontSizeMult / _fontSizeFraction): a
-# line is fontSize * 1.13 tall, and its baseline sits 22.2% of that height
-# above the line's bottom.
+# Fabric.js text metrics (FabricText._fontSizeMult / _fontSizeFraction): a line
+# is fontSize * 1.13 tall. Its baseline is 22.2% of that height above the
+# bottom of the line.
 FABRIC_FONT_SIZE_MULT = 1.13
 FABRIC_FONT_SIZE_FRACTION = 0.222
 
-# Rough Arial advance per character, in em. Only used for the box width
-# stored on text coming from RV; Fabric re-measures the text when Kitsu
-# loads it, and the width doesn't affect where the text is drawn.
+# Rough Arial advance per character, in em. The code uses it only for the box
+# width stored on text from RV. Fabric measures the text again when Kitsu loads
+# it. The width does not change where the text is drawn.
 _ARIAL_AVG_ADVANCE_EM = 0.55
 
-# RV annotate mode also writes a legacy "size" for pre-QFont RV builds,
-# which draw text size * scale * 12.5 tall. Current RV reads "fontSize".
+# RV annotate mode also writes a legacy "size" for RV builds that are older
+# than QFont. These builds draw text with a height of size * scale * 12.5.
+# Current RV reads "fontSize".
 RV_LEGACY_TEXT_SIZE_FACTOR = 12.5
 
-# RV's annotate mode keeps an editing cursor (0x01) at the end of a text
-# while it's being typed; it and other control characters aren't content.
+# While the user types a text, RV annotate mode keeps an editing cursor (0x01)
+# at the end of it. The cursor and other control characters are not content.
 _TEXT_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 _HEX_COLOR_RE = re.compile(r"^#?[0-9a-fA-F]{6}$")
 
 _NO_COLOR_VALUES = {"none", "null", "transparent", ""}
 
-# Fully transparent RV color, in the flat 0..255 form `convertToORV` emits.
+# Fully transparent RV color, in the flat 0..255 form that `convertToORV`
+# makes.
 _RV_NO_COLOR = [255, 255, 255, 0]
 
-# RV pen "mode": 0 paints, 1 erases what was drawn before it on the frame.
+# RV pen "mode": 0 paints. 1 erases what was drawn before it on the frame.
 RV_PEN_MODE_PAINT = 0
 RV_PEN_MODE_ERASE = 1
 
-# RV's own eraser pens are white; the color isn't drawn.
+# The eraser pens of RV are white. The color is not drawn.
 _RV_ERASER_COLOR = [255, 255, 255, 255]
 
-# Kitsu erasers: a Fabric "eraser" group on the erased object, holding one
-# "path" per eraser stroke, drawn with "destination-out" so it cuts the
-# object. Kitsu's eraser brush paints them black.
+# Kitsu erasers: a Fabric "eraser" group on the erased object. It holds one
+# "path" for each eraser stroke. The paths use "destination-out", so they cut
+# the object. The eraser brush of Kitsu paints them black.
 KITSU_ERASER_TYPE = "eraser"
 KITSU_ERASE_OPERATION = "destination-out"
 KITSU_ERASER_STROKE = "#000"
 
-# Fabric paths are curves; RV pens are polylines. Curves are sampled about
-# every FLATTEN_STEP_PX canvas px (Kitsu's brush curves are only a few px
-# long, so most become one or two points).
+# Fabric paths are curves, but RV pens are polylines. The code samples the
+# curves about every FLATTEN_STEP_PX canvas px. The brush curves of Kitsu are
+# only a few px long, so most curves become one or two points.
 FLATTEN_STEP_PX = 2.0
 FLATTEN_MAX_STEPS = 16
 
-# Namespace for the ids given to RV eraser pens made from Kitsu erasers,
-# so the same Kitsu eraser gets the same id every time it's loaded.
+# Namespace for the ids of the RV eraser pens made from Kitsu erasers. It gives
+# the same id to the same Kitsu eraser each time the code loads it.
 _ERASER_UUID_NAMESPACE = uuid.UUID("5d7e1c2a-3b4f-4e8a-9c61-2f0d8a7b4e19")
 
 
@@ -126,59 +135,91 @@ _ERASER_UUID_NAMESPACE = uuid.UUID("5d7e1c2a-3b4f-4e8a-9c61-2f0d8a7b4e19")
 # Coordinate and color helpers
 # ---------------------------------------------------------------------------
 
-# RV paint space is OpenRV's normalized image space: the image is centred on
-# the origin and is 1 unit tall, so y runs -0.5 (bottom) .. +0.5 (top) and x
-# runs -aspect/2 .. +aspect/2. Pen widths are expressed in the same units,
-# so 1 canvas pixel of stroke width is 1 / canvas_height RV units.
+# RV paint space is the normalized image space of OpenRV. The image is centred
+# on the origin and is 1 unit tall. So y goes from -0.5 (bottom) to +0.5 (top)
+# and x goes from -aspect/2 to +aspect/2. Pen widths use the same units. So 1
+# canvas pixel of stroke width is 1 / canvas_height RV units.
+
+
+def _warn(message: str) -> None:
+    print(f"warning: {message}", file=sys.stderr)
+
+
+class _PaintSpace(NamedTuple):
+    """
+    Give the sizes that a conversion between RV and Kitsu coordinates needs.
+
+    `width` and `height` are the media size. `canvas_width` and
+    `canvas_height` are the size of the Fabric.js canvas. The two sizes can
+    be different.
+    """
+
+    width: int
+    height: int
+    canvas_width: float
+    canvas_height: float
+
 
 def _aspect(width: int, height: int) -> float:
     return float(width) / float(height) if width and height else 1.0
 
 
 def rv_normalized_to_pixel(
-    nx: float, ny: float, width: int, height: int,
-    canvas_width: float, canvas_height: float,
+    nx: float,
+    ny: float,
+    space: _PaintSpace,
 ) -> Point:
-    """OpenRV -> Kitsu: RV paint-space normalized point -> Fabric.js canvas
-    pixels (origin top-left, y down).
     """
-    px = (nx / _aspect(width, height) + 0.5) * canvas_width
-    py = (0.5 - ny) * canvas_height
+    OpenRV -> Kitsu: convert a normalized point of RV paint space to Fabric.js
+    canvas pixels (origin top-left, y down).
+    """
+    px = (nx / _aspect(space.width, space.height) + 0.5) * space.canvas_width
+    py = (0.5 - ny) * space.canvas_height
     return px, py
 
 
 def pixel_to_rv_normalized(
-    px: float, py: float, width: int, height: int,
-    canvas_width: float, canvas_height: float,
+    px: float,
+    py: float,
+    space: _PaintSpace,
 ) -> Point:
-    """Kitsu -> OpenRV: Fabric.js canvas pixels -> RV paint-space
-    normalized point. Inverse of `rv_normalized_to_pixel`.
     """
-    nx = (px / canvas_width - 0.5) * _aspect(width, height)
-    ny = 0.5 - py / canvas_height
+    Kitsu -> OpenRV: convert Fabric.js canvas pixels to a normalized point of
+    RV paint space. This is the inverse of `rv_normalized_to_pixel`.
+    """
+    nx = (px / space.canvas_width - 0.5) * _aspect(space.width, space.height)
+    ny = 0.5 - py / space.canvas_height
     return nx, ny
 
 
 def px_width_to_rv(width_px: float, canvas_height: float) -> float:
-    """Kitsu -> OpenRV: a stroke width in canvas pixels -> RV units."""
+    """
+    Kitsu -> OpenRV: convert a stroke width from canvas pixels to RV units.
+    """
     return float(width_px) / float(canvas_height)
 
 
 def rv_width_to_px(width_rv: float, canvas_height: float) -> float:
-    """OpenRV -> Kitsu: a stroke width in RV units -> canvas pixels."""
+    """
+    OpenRV -> Kitsu: convert a stroke width from RV units to canvas pixels.
+    """
     return float(width_rv) * float(canvas_height)
 
 
 def _clean(value: float, digits: int = 3) -> Any:
-    """Round away float32 noise picked up inside RV (489.98999954 -> 489.99)
-    and write whole numbers as ints, the way Kitsu stores them."""
+    """
+    Round away the float32 noise that RV adds (489.98999954 -> 489.99). Write
+    whole numbers as ints, as Kitsu stores them.
+    """
     r = round(float(value), digits)
     return int(r) if r == int(r) else r
 
 
 def _rv_rgba(color: Any) -> Optional[Tuple[float, float, float, float]]:
-    """An RV color as 0..1 floats. Accepts RV's own [[r, g, b, a]] rows
-    (0..1) and the flat [r, g, b, a] that `convertToORV` emits (0..255)."""
+    """
+    Return an RV color as 0..1 floats. Accept the [[r, g, b, a]] rows of RV
+    (0..1) and the flat [r, g, b, a] that `convertToORV` makes (0..255).
+    """
     if not color:
         return None
     row = color[0] if isinstance(color[0], (list, tuple)) else color
@@ -191,18 +232,22 @@ def _rv_rgba(color: Any) -> Optional[Tuple[float, float, float, float]]:
 
 
 def rv_color_to_hex(color_rows: Any) -> str:
-    """OpenRV -> Kitsu: RV stores color as a list of [r, g, b, a] floats
-    in 0..1. Kitsu's "stroke"/"fill" fields are plain hex strings, e.g.
-    "#ff3860"."""
+    """
+    OpenRV -> Kitsu: RV stores a color as a list of [r, g, b, a] floats in
+    0..1. The "stroke" and "fill" fields of Kitsu are plain hex strings, for
+    example "#ff3860".
+    """
     rgba = _rv_rgba(color_rows)
     if rgba is None:
         return "#ffffff"
     r, g, b, _a = rgba
-    return "#{:02x}{:02x}{:02x}".format(round(r * 255), round(g * 255), round(b * 255))
+    return f"#{round(r * 255):02x}{round(g * 255):02x}{round(b * 255):02x}"
 
 
 def rv_alpha(color_rows: Any) -> float:
-    """OpenRV -> Kitsu: pull the alpha channel out of an RV color row."""
+    """
+    OpenRV -> Kitsu: get the alpha channel from an RV color row.
+    """
     rgba = _rv_rgba(color_rows)
     return 1.0 if rgba is None else rgba[3]
 
@@ -212,12 +257,16 @@ def _is_hex_color(value: Any) -> bool:
 
 
 def _is_no_color(value: Any) -> bool:
-    return value is None or (isinstance(value, str) and value.strip().lower() in _NO_COLOR_VALUES)
+    return value is None or (
+        isinstance(value, str) and value.strip().lower() in _NO_COLOR_VALUES
+    )
 
 
 def _has_color(value: Any) -> bool:
-    """True if `value` is an actual color (rgba array or hex string), as
-    opposed to a "none"/"transparent"/None sentinel."""
+    """
+    Return True if `value` is an actual color (rgba array or hex string).
+    Return False for a "none", "transparent" or None marker.
+    """
     if _is_no_color(value):
         return False
     if isinstance(value, (list, tuple)) and len(value) >= 3:
@@ -226,24 +275,26 @@ def _has_color(value: Any) -> bool:
 
 
 def color_to_rv_color(value: Any, opacity: float = 1.0) -> List[int]:
-    """Kitsu -> OpenRV: a Kitsu/Fabric "stroke" or "fill" value -> an RV
-    [r, g, b, a] color, each channel an INTEGER 0..255. Inverse of
-    `rv_color_to_hex`/`rv_alpha`.
+    """
+    Kitsu -> OpenRV: convert a "stroke" or "fill" value of Kitsu/Fabric to an
+    RV [r, g, b, a] color. Each channel is an INTEGER 0..255. This is the
+    inverse of `rv_color_to_hex` and `rv_alpha`.
 
-    Accepts whatever form the real data hands back:
-      * an rgba array, e.g. [255, 56, 96, 255] or [255, 56, 96] (3 or 4
-        numbers, each already on a 0..255 scale) -- this is what real
-        Kitsu annotation objects actually contain.
-      * a "#rrggbb" hex string, kept for backwards compatibility.
-      * Fabric.js/CSS "none"/"transparent"/None -> treated as opaque
-        white (i.e. "no color set").
+    Accepted forms (the forms that the real data contains):
+      * An rgba array, for example [255, 56, 96, 255] or [255, 56, 96].
+        It has 3 or 4 numbers, each already on a 0..255 scale. Real Kitsu
+        annotation objects contain this form.
+      * A "#rrggbb" hex string. The code keeps it for backwards
+        compatibility.
+      * Fabric.js/CSS "none", "transparent" or None. The code treats it as
+        opaque white (that is, "no color set").
 
-    `opacity` is Fabric's separate 0..1 "opacity" field, scaled to
-    0..255 and used as the alpha channel ONLY when `value` doesn't
-    already carry its own 4th (alpha) element.
+    `opacity` is the separate 0..1 "opacity" field of Fabric. The code scales
+    it to 0..255 and uses it as the alpha channel ONLY when `value` does not
+    already have its own 4th (alpha) element.
 
-    Falls back to opaque white (with a stderr warning) instead of
-    raising if `value` doesn't match any recognized shape.
+    If `value` has no recognized shape, the function does not raise an error.
+    It returns opaque white and writes a warning to stderr.
     """
     fallback_alpha = round(max(0.0, min(1.0, opacity)) * 255)
 
@@ -260,11 +311,25 @@ def color_to_rv_color(value: Any, opacity: float = 1.0) -> List[int]:
         r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
         return [r, g, b, fallback_alpha]
 
-    print(f"warning: unrecognized color value {value!r}, falling back to white", file=sys.stderr)
+    _warn(f"unrecognized color value {value!r}, falling back to white")
     return [255, 255, 255, fallback_alpha]
 
 
-hex_to_rv_color = color_to_rv_color
+def _per_point_widths(raw: Any, count: int) -> List[float]:
+    """
+    Return the RV pen "width" as one value for each point. RV stores one entry
+    for each point (modulated by pressure). Older data can hold a single value
+    or a bare float.
+    """
+    if isinstance(raw, (int, float)):
+        widths = [float(raw)]
+    else:
+        widths = [float(w) for w in (raw or [])]
+    if not widths:
+        widths = [0.01]
+    if len(widths) < count:
+        widths += [widths[-1]] * (count - len(widths))
+    return widths[:count]
 
 
 # ---------------------------------------------------------------------------
@@ -282,39 +347,48 @@ def _check_fps(fps: float) -> float:
 
 
 def kitsu_frame_duration(fps: float) -> float:
-    """Length of one frame in seconds, as Kitsu's player computes it:
-    1 / fps rounded to 4 decimals (30 fps -> 0.0333, 24 fps -> 0.0417)."""
+    """
+    Return the length of one frame in seconds, as the player of Kitsu computes
+    it: 1 / fps rounded to 4 decimals (30 fps -> 0.0333, 24 fps -> 0.0417).
+    """
     return round(1.0 / _check_fps(fps), 4)
 
 
 def frame_to_time(frame_num: int, fps: float, frame_base: int = 1) -> float:
-    """Kitsu record "time", in SECONDS from the first frame, for a frame
-    number at the production's frame rate. Uses Kitsu's rounded frame
-    duration so the values match what Kitsu writes itself (frame 34 at
-    30 fps -> 1.0989)."""
+    """
+    Return the "time" of a Kitsu record for a frame number.
+
+    The unit is SECONDS from the first frame, at the production frame rate.
+    The function uses the rounded frame duration of Kitsu. Thus the values
+    are the same as the values that Kitsu writes (frame 34 at 30 fps ->
+    1.0989).
+    """
     return round((frame_num - frame_base) * kitsu_frame_duration(fps), 4)
 
 
 def time_to_frame(time_s: float, fps: float, frame_base: int = 1) -> int:
-    """Inverse of `frame_to_time`: a Kitsu "time" in seconds -> frame."""
+    """
+    Inverse of `frame_to_time`: convert a Kitsu "time" in seconds to a frame.
+    """
     return frame_base + round(float(time_s) / kitsu_frame_duration(fps))
 
 
-def frame_to_time_ms(frame_num: int, fps: float, frame_base: int = 1) -> int:
-    """Deprecated: Kitsu stores "time" in seconds, use `frame_to_time`."""
-    return round((frame_num - frame_base) / _check_fps(fps) * 1000)
-
-
-def time_ms_to_frame(time_ms: float, fps: float, frame_base: int = 1) -> int:
-    """Deprecated: Kitsu stores "time" in seconds, use `time_to_frame`."""
-    return frame_base + round(float(time_ms) / 1000.0 * _check_fps(fps))
+def _iso_ms(epoch_ms: int) -> str:
+    dt = _dt.datetime.fromtimestamp(epoch_ms / 1000.0, tz=_dt.timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
 # ---------------------------------------------------------------------------
 # Fabric.js box geometry (ellipses and rects)
 # ---------------------------------------------------------------------------
 
-_ORIGIN_FACTOR = {"left": 0.0, "top": 0.0, "center": 0.5, "right": 1.0, "bottom": 1.0}
+_ORIGIN_FACTOR = {
+    "left": 0.0,
+    "top": 0.0,
+    "center": 0.5,
+    "right": 1.0,
+    "bottom": 1.0,
+}
 
 
 def _origin_factor(value: Any) -> float:
@@ -324,27 +398,61 @@ def _origin_factor(value: Any) -> float:
 
 
 def _size_fallback(obj: Dict[str, Any], key: str) -> float:
-    """Full width/height of an object with no "width"/"height" field. Only
-    an ellipse can be sized from its radii; a rect's rx/ry are corner
-    radii, not its size."""
+    """
+    Return the full width and height of an object that has no "width" or
+    "height" field. Only an ellipse can get its size from its radii. The rx/ry
+    of a rect are corner radii, not its size.
+    """
     if obj.get("type") not in KITSU_ELLIPSE_TYPES:
         return 0.0
     return 2.0 * float(obj.get(key, obj.get("radius", 0)) or 0)
 
 
-def _fabric_box_geometry(obj: Dict[str, Any]) -> Tuple[float, float, float, float, float]:
-    """(cx, cy, half width, half height, rendered stroke width), in canvas
-    px, of a Fabric "circle", "ellipse" or "rect", measured along the
-    stroke's centre line (for an ellipse, its radii).
+def _fabric_scale(obj: Dict[str, Any]) -> Point:
+    return (
+        abs(float(obj.get("scaleX", 1) or 1)),
+        abs(float(obj.get("scaleY", 1) or 1)),
+    )
 
-    Fabric positions an object by its stroke-inclusive box, which is
-    (width + strokeWidth) * scale, or width * scale + strokeWidth with
-    strokeUniform. left/top is that box's origin point (originX/originY)
-    and the box is rotated by `angle` about it.
+
+def _fabric_box_dims(obj: Dict[str, Any], w: float, h: float) -> Point:
     """
-    sx = abs(float(obj.get("scaleX", 1) or 1))
-    sy = abs(float(obj.get("scaleY", 1) or 1))
+    Return the width and height of the scaled box of an object, stroke
+    included. Fabric uses this box to position the object.
+    """
+    sx, sy = _fabric_scale(obj)
     sw = float(obj.get("strokeWidth") or 0)
+    if obj.get("strokeUniform"):
+        return w * sx + sw, h * sy + sw
+    return (w + sw) * sx, (h + sw) * sy
+
+
+def _fabric_stroke_width(obj: Dict[str, Any]) -> float:
+    """
+    Return the rendered stroke width. Without strokeUniform, the outline scales
+    with the object, and RV has only one width.
+    """
+    sw = float(obj.get("strokeWidth") or 0)
+    if obj.get("strokeUniform"):
+        return sw
+    sx, sy = _fabric_scale(obj)
+    return sw * (sx + sy) / 2.0
+
+
+def _fabric_box_geometry(
+    obj: Dict[str, Any],
+) -> Tuple[float, float, float, float, float]:
+    """
+    Return (cx, cy, half width, half height, rendered stroke width) of a Fabric
+    "circle", "ellipse" or "rect". The values are in canvas px. They are
+    measured along the centre line of the stroke (for an ellipse, its radii).
+
+    Fabric positions an object by its stroke-inclusive box. The box is (width +
+    strokeWidth) * scale, or width * scale + strokeWidth with strokeUniform.
+    left/top is the origin point of the box (originX/originY). The box is
+    rotated by `angle` about this point.
+    """
+    sx, sy = _fabric_scale(obj)
 
     w = obj.get("width")
     h = obj.get("height")
@@ -354,22 +462,16 @@ def _fabric_box_geometry(obj: Dict[str, Any]) -> Tuple[float, float, float, floa
         h = _size_fallback(obj, "ry")
     w, h = float(w), float(h)
 
-    if obj.get("strokeUniform"):
-        box_w, box_h = w * sx + sw, h * sy + sw
-        rendered_sw = sw
-    else:
-        box_w, box_h = (w + sw) * sx, (h + sw) * sy
-        # The outline is scaled with the object; RV only has one width.
-        rendered_sw = sw * (sx + sy) / 2.0
-
-    cx, cy = _fabric_center(obj, box_w, box_h)
-    return cx, cy, w * sx / 2.0, h * sy / 2.0, rendered_sw
+    cx, cy = _fabric_center(obj, *_fabric_box_dims(obj, w, h))
+    return cx, cy, w * sx / 2.0, h * sy / 2.0, _fabric_stroke_width(obj)
 
 
 def _fabric_center(obj: Dict[str, Any], box_w: float, box_h: float) -> Point:
-    """Centre, in canvas px, of a Fabric object whose stroke-inclusive,
-    scaled box is box_w x box_h. left/top is that box's origin point
-    (originX/originY), and the box is rotated by `angle` about it."""
+    """
+    Return the centre, in canvas px, of a Fabric object. Its scaled,
+    stroke-inclusive box is box_w x box_h. left/top is the origin point of the
+    box (originX/originY). The box is rotated by `angle` about this point.
+    """
     vx = (0.5 - _origin_factor(obj.get("originX", "left"))) * box_w
     vy = (0.5 - _origin_factor(obj.get("originY", "top"))) * box_h
     a = math.radians(float(obj.get("angle") or 0))
@@ -382,39 +484,47 @@ def _fabric_center(obj: Dict[str, Any], box_w: float, box_h: float) -> Point:
 # Text geometry
 # ---------------------------------------------------------------------------
 
+
 def _clean_text(value: Any) -> str:
-    """Annotation text without RV's typing cursor or other control
-    characters (line breaks and tabs are kept)."""
+    """
+    Return the annotation text without the typing cursor of RV or other control
+    characters. Line breaks and tabs stay in the text.
+    """
     text = "" if value is None else str(value)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     return _TEXT_CONTROL_RE.sub("", text)
 
 
-def _fabric_text_height(font_px: float, line_height: float, n_lines: int) -> float:
-    """FabricText.calcTextHeight for a uniformly styled text: every line
-    but the last is spaced by lineHeight."""
+def _fabric_text_height(
+    font_px: float, line_height: float, n_lines: int
+) -> float:
+    """
+    Return the height of a uniformly styled text, as FabricText.calcTextHeight
+    does. Each line except the last has the spacing lineHeight.
+    """
     line = font_px * FABRIC_FONT_SIZE_MULT
     return line * (line_height * (max(1, n_lines) - 1) + 1)
 
 
 def _fabric_baseline_offset(font_px: float) -> float:
-    """Distance from the top of a Fabric text's first line to its baseline."""
+    """
+    Return the distance from the top of the first line of a Fabric text to its
+    baseline.
+    """
     return font_px * FABRIC_FONT_SIZE_MULT * (1.0 - FABRIC_FONT_SIZE_FRACTION)
 
 
 def _fabric_text_anchor(obj: Dict[str, Any]) -> Tuple[float, float, float]:
-    """(x, y, rendered font size), in canvas px, of a Fabric text: x/y is
-    the left end of the first line's baseline, which is where RV anchors
-    text.
-
-    Fabric positions text like any object, by its box padded with
-    strokeWidth (applied even when the text has no stroke), and draws the
-    first line's baseline a fixed fraction of the line height below the
-    unpadded box's top.
     """
-    sx = abs(float(obj.get("scaleX", 1) or 1))
-    sy = abs(float(obj.get("scaleY", 1) or 1))
-    sw = float(obj.get("strokeWidth") or 0)
+    Return (x, y, rendered font size), in canvas px, of a Fabric text. x/y is
+    the left end of the baseline of the first line. RV anchors text there.
+
+    Fabric positions text like any object: by its box with strokeWidth added
+    around it. It does this even when the text has no stroke. Fabric draws the
+    baseline of the first line at a fixed fraction of the line height below the
+    top of the box without this strokeWidth.
+    """
+    sx, sy = _fabric_scale(obj)
     font_px = float(obj.get("fontSize") or 16)
     lines = _clean_text(obj.get("text")).split("\n")
 
@@ -424,14 +534,13 @@ def _fabric_text_anchor(obj: Dict[str, Any]) -> Tuple[float, float, float]:
         w = max(len(line) for line in lines) * _ARIAL_AVG_ADVANCE_EM * font_px
     if h is None:
         h = _fabric_text_height(
-            font_px, float(obj.get("lineHeight") or KITSU_TEXT_LINE_HEIGHT), len(lines))
+            font_px,
+            float(obj.get("lineHeight") or KITSU_TEXT_LINE_HEIGHT),
+            len(lines),
+        )
     w, h = float(w), float(h)
 
-    if obj.get("strokeUniform"):
-        box_w, box_h = w * sx + sw, h * sy + sw
-    else:
-        box_w, box_h = (w + sw) * sx, (h + sw) * sy
-    cx, cy = _fabric_center(obj, box_w, box_h)
+    cx, cy = _fabric_center(obj, *_fabric_box_dims(obj, w, h))
 
     # Offset of the anchor from the centre, in unscaled object space.
     dx = -w / 2.0
@@ -446,8 +555,10 @@ def _fabric_text_anchor(obj: Dict[str, Any]) -> Tuple[float, float, float]:
 
 
 def _rv_point(value: Any) -> Point:
-    """An RV 2D point given flat ([x, y], as RV hands text positions back)
-    or nested ([[x, y]], as for other shapes' positions)."""
+    """
+    Return an RV 2D point. The input is flat ([x, y], as RV returns text
+    positions) or nested ([[x, y]], as for the positions of other shapes).
+    """
     if value and isinstance(value[0], (list, tuple)):
         value = value[0]
     return float(value[0]), float(value[1])
@@ -460,8 +571,11 @@ def _rv_scalar(value: Any, default: Optional[float] = None) -> Optional[float]:
 
 
 def _rv_text_font_size(props: Dict[str, Any]) -> float:
-    """An RV text's height in RV units: its "fontSize", or for sessions
-    written before RV had one, the legacy size * scale * 12.5."""
+    """
+    Return the height of an RV text in RV units. It is the "fontSize". For
+    sessions written before RV had this field, it is the legacy size * scale *
+    12.5.
+    """
     font_size = _rv_scalar(props.get("fontSize"))
     if font_size is not None and font_size > 0:
         return font_size
@@ -471,32 +585,28 @@ def _rv_text_font_size(props: Dict[str, Any]) -> float:
 
 
 def _fabric_line_endpoints(obj: Dict[str, Any]) -> Tuple[Point, Point, float]:
-    """((tail x, y), (head x, y), rendered stroke width), in canvas px, of
-    a Fabric Line-based object such as Kitsu's "arrow".
+    """
+    Return ((tail x, y), (head x, y), rendered stroke width), in canvas px.
 
-    Fabric keeps a line's true position in its box (left/top/width/height,
-    scale, angle, flips); x1..y2 only say which corner is which end and
-    aren't updated when the object is moved, scaled or rotated. So the ends
-    are rebuilt from the box, and x1..y2 are used directly only when the
-    object has no box fields.
+    The object is a Fabric object based on Line, such as the "arrow" of Kitsu.
+
+    Fabric keeps the true position of a line in its box (left/top/width/height,
+    scale, angle, flips). The x1..y2 fields only show which corner is which
+    end. Fabric does not update them when the object is moved, scaled or
+    rotated. So the function rebuilds the ends from the box. It uses x1..y2
+    directly only when the object has no box fields.
     """
     x1, y1 = float(obj.get("x1", 0)), float(obj.get("y1", 0))
     x2, y2 = float(obj.get("x2", 0)), float(obj.get("y2", 0))
-    sw = float(obj.get("strokeWidth") or 0)
     if obj.get("left") is None or obj.get("top") is None:
-        return (x1, y1), (x2, y2), sw
+        return (x1, y1), (x2, y2), float(obj.get("strokeWidth") or 0)
 
     sx = float(obj.get("scaleX", 1) or 1)
     sy = float(obj.get("scaleY", 1) or 1)
     w = float(obj["width"]) if obj.get("width") is not None else abs(x2 - x1)
     h = float(obj["height"]) if obj.get("height") is not None else abs(y2 - y1)
 
-    if obj.get("strokeUniform"):
-        box_w, box_h = w * abs(sx) + sw, h * abs(sy) + sw
-        rendered_sw = sw
-    else:
-        box_w, box_h = (w + sw) * abs(sx), (h + sw) * abs(sy)
-        rendered_sw = sw * (abs(sx) + abs(sy)) / 2.0
+    box_w, box_h = _fabric_box_dims(obj, w, h)
 
     a = math.radians(float(obj.get("angle") or 0))
     cos_a, sin_a = math.cos(a), math.sin(a)
@@ -510,7 +620,7 @@ def _fabric_line_endpoints(obj: Dict[str, Any]) -> Tuple[Point, Point, float]:
     )
     cx, cy = float(obj["left"]) + ox, float(obj["top"]) + oy
 
-    # Tail offset from the centre in object space; the head is opposite.
+    # Offset of the tail from the centre in object space. The head is opposite.
     dx = (-1.0 if x1 <= x2 else 1.0) * w / 2.0 * sx
     dy = (-1.0 if y1 <= y2 else 1.0) * h / 2.0 * sy
     if obj.get("flipX"):
@@ -518,27 +628,32 @@ def _fabric_line_endpoints(obj: Dict[str, Any]) -> Tuple[Point, Point, float]:
     if obj.get("flipY"):
         dy = -dy
     tx, ty = rotate(dx, dy)
-    return (cx + tx, cy + ty), (cx - tx, cy - ty), rendered_sw
+    return (cx + tx, cy + ty), (cx - tx, cy - ty), _fabric_stroke_width(obj)
 
 
 # ---------------------------------------------------------------------------
 # Fabric.js transforms
 # ---------------------------------------------------------------------------
 
-# Affine matrices in Fabric's [a, b, c, d, e, f] form:
+# Affine matrices use the Fabric form [a, b, c, d, e, f]:
 #   x' = a*x + c*y + e,   y' = b*x + d*y + f
 Matrix = Tuple[float, float, float, float, float, float]
 _IDENTITY: Matrix = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
 
 
 def _mat_mul(m: Matrix, n: Matrix) -> Matrix:
-    """m * n: apply n first, then m (Fabric's multiplyTransformMatrices)."""
+    """
+    Return m * n: apply n first, then m (multiplyTransformMatrices of Fabric).
+    """
     a, b, c, d, e, f = m
     a2, b2, c2, d2, e2, f2 = n
     return (
-        a * a2 + c * b2, b * a2 + d * b2,
-        a * c2 + c * d2, b * c2 + d * d2,
-        a * e2 + c * f2 + e, b * e2 + d * f2 + f,
+        a * a2 + c * b2,
+        b * a2 + d * b2,
+        a * c2 + c * d2,
+        b * c2 + d * d2,
+        a * e2 + c * f2 + e,
+        b * e2 + d * f2 + f,
     )
 
 
@@ -548,8 +663,12 @@ def _mat_inv(m: Matrix) -> Matrix:
     if not det:
         return _IDENTITY
     return (
-        d / det, -b / det, -c / det, a / det,
-        (c * f - d * e) / det, (b * e - a * f) / det,
+        d / det,
+        -b / det,
+        -c / det,
+        a / det,
+        (c * f - d * e) / det,
+        (b * e - a * f) / det,
     )
 
 
@@ -563,14 +682,21 @@ def _mat_translate(x: float, y: float) -> Matrix:
 
 
 def _mat_scale_factor(m: Matrix) -> float:
-    """How much `m` scales lengths on average (what a stroke width gets)."""
+    """
+    Return the average factor by which `m` scales lengths (a stroke width gets
+    this factor).
+    """
     return math.sqrt(abs(m[0] * m[3] - m[1] * m[2]))
 
 
-def _qr_decompose(m: Matrix) -> Tuple[float, float, float, float, float, float]:
-    """(angle, scaleX, scaleY, skewX, translateX, translateY) of `m`, angles
-    in degrees, as Fabric's qrDecompose splits a matrix into an object's
-    transform options."""
+def _qr_decompose(
+    m: Matrix,
+) -> Tuple[float, float, float, float, float, float]:
+    """
+    Return (angle, scaleX, scaleY, skewX, translateX, translateY) of `m`, with
+    angles in degrees. This is how qrDecompose of Fabric splits a matrix into
+    the transform options of an object.
+    """
     a, b, c, d, e, f = m
     denom = a * a + b * b
     if not denom:
@@ -578,11 +704,21 @@ def _qr_decompose(m: Matrix) -> Tuple[float, float, float, float, float, float]:
     scale_x = math.sqrt(denom)
     scale_y = (a * d - c * b) / scale_x
     skew_x = math.atan2(a * c + b * d, denom)
-    return math.degrees(math.atan2(b, a)), scale_x, scale_y, math.degrees(skew_x), e, f
+    return (
+        math.degrees(math.atan2(b, a)),
+        scale_x,
+        scale_y,
+        math.degrees(skew_x),
+        e,
+        f,
+    )
 
 
 def _fabric_size(obj: Dict[str, Any]) -> Point:
-    """Unscaled width/height of a Fabric object, without its stroke."""
+    """
+    Return the unscaled width and height of a Fabric object, without its
+    stroke.
+    """
     w, h = obj.get("width"), obj.get("height")
     if w is None or h is None:
         obj_type = obj.get("type")
@@ -598,24 +734,20 @@ def _fabric_size(obj: Dict[str, Any]) -> Point:
     return float(w), float(h)
 
 
-def _fabric_box_dims(obj: Dict[str, Any], w: float, h: float) -> Point:
-    """Width/height of an object's scaled, stroke-inclusive box, which is
-    what Fabric positions it by."""
-    sx = abs(float(obj.get("scaleX", 1) or 1))
-    sy = abs(float(obj.get("scaleY", 1) or 1))
-    sw = float(obj.get("strokeWidth") or 0)
-    if obj.get("strokeUniform"):
-        return w * sx + sw, h * sy + sw
-    return (w + sw) * sx, (h + sw) * sy
+def _fabric_matrix(
+    obj: Dict[str, Any], size: Optional[Point] = None
+) -> Matrix:
+    """
+    Return the calcOwnMatrix of Fabric.
 
+    This matrix maps the plane of an object into the plane of its parent. The
+    origin of the object plane is at its centre. The parent is the canvas, or
+    the group that holds the object.
 
-def _fabric_matrix(obj: Dict[str, Any], size: Optional[Point] = None) -> Matrix:
-    """Fabric's calcOwnMatrix: maps an object's own plane (origin at its
-    centre) into its parent's (the canvas, or the group it sits in).
-
-    `size` overrides the object's width/height (paths are sized by their
-    path data). Skew isn't counted in the box size, which only matters for
-    skewed objects, which Kitsu doesn't make."""
+    `size` overrides the width and height of the object (the path data gives
+    the size of paths). The box size does not include skew. This matters only
+    for skewed objects, and Kitsu does not make them.
+    """
     w, h = size if size is not None else _fabric_size(obj)
     cx, cy = _fabric_center(obj, *_fabric_box_dims(obj, w, h))
     sx = float(obj.get("scaleX", 1) or 1) * (-1.0 if obj.get("flipX") else 1.0)
@@ -626,24 +758,29 @@ def _fabric_matrix(obj: Dict[str, Any], size: Optional[Point] = None) -> Matrix:
     m = _mat_mul(m, (sx, 0.0, 0.0, sy, 0.0, 0.0))
     skew_x = float(obj.get("skewX") or 0)
     if skew_x:
-        m = _mat_mul(m, (1.0, 0.0, math.tan(math.radians(skew_x)), 1.0, 0.0, 0.0))
+        m = _mat_mul(
+            m, (1.0, 0.0, math.tan(math.radians(skew_x)), 1.0, 0.0, 0.0)
+        )
     skew_y = float(obj.get("skewY") or 0)
     if skew_y:
-        m = _mat_mul(m, (1.0, math.tan(math.radians(skew_y)), 0.0, 1.0, 0.0, 0.0))
+        m = _mat_mul(
+            m, (1.0, math.tan(math.radians(skew_y)), 0.0, 1.0, 0.0, 0.0)
+        )
     return m
 
 
 def _fabric_aabb(obj: Dict[str, Any]) -> Tuple[float, float, float, float]:
-    """(x0, y0, x1, y1): axis-aligned box, in its parent's coordinates, of
-    an object's stroke-inclusive outline (what Fabric tests against when it
-    decides which objects an eraser stroke touches)."""
+    """
+    Return (x0, y0, x1, y1): the axis-aligned box of the stroke-inclusive
+    outline of an object, in the coordinates of its parent. Fabric tests
+    against this box when it decides which objects an eraser stroke touches.
+    """
     w, h = _fabric_size(obj)
     sw = float(obj.get("strokeWidth") or 0)
     if obj.get("strokeUniform"):
-        # The stroke isn't scaled, so in the object's own (unscaled) plane
-        # it is sw / scale wide.
-        sx = abs(float(obj.get("scaleX", 1) or 1))
-        sy = abs(float(obj.get("scaleY", 1) or 1))
+        # The stroke is not scaled. So in the own (unscaled) plane of the
+        # object, it is sw / scale wide.
+        sx, sy = _fabric_scale(obj)
         hx, hy = (w + sw / sx) / 2.0, (h + sw / sy) / 2.0
     else:
         hx, hy = (w + sw) / 2.0, (h + sw) / 2.0
@@ -658,7 +795,9 @@ def _boxes_overlap(a: Sequence[float], b: Sequence[float]) -> bool:
     return a[0] <= b[2] and b[0] <= a[2] and a[1] <= b[3] and b[1] <= a[3]
 
 
-def _points_bbox(points: Sequence[Point], pad: float = 0.0) -> Tuple[float, float, float, float]:
+def _points_bbox(
+    points: Sequence[Point], pad: float = 0.0
+) -> Tuple[float, float, float, float]:
     xs = [p[0] for p in points]
     ys = [p[1] for p in points]
     return min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad
@@ -668,17 +807,22 @@ def _points_bbox(points: Sequence[Point], pad: float = 0.0) -> Tuple[float, floa
 # Fabric.js path data
 # ---------------------------------------------------------------------------
 
-# A parsed path is a list of subpaths; each subpath starts with ("M", p)
-# followed by ("L", p), ("Q", ctl, p) or ("C", ctl1, ctl2, p) segments.
+# A parsed path is a list of subpaths. Each subpath starts with ("M", p). It
+# continues with ("L", p), ("Q", ctl, p) or ("C", ctl1, ctl2, p) segments.
 Segment = Tuple[Any, ...]
 
-_PATH_TOKEN_RE = re.compile(r"[A-Za-z]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
+_PATH_TOKEN_RE = re.compile(
+    r"[A-Za-z]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
+)
 _PATH_ARITY = {"M": 2, "L": 2, "H": 1, "V": 1, "Q": 4, "C": 6, "Z": 0}
 
 
 def _path_commands(path: Any) -> List[List[Any]]:
-    """Fabric path data as [command, *numbers] lists. Fabric stores the
-    parsed form (lists); an SVG path string is tokenized into the same."""
+    """
+    Return Fabric path data as [command, *numbers] lists. Fabric stores the
+    parsed form (lists). The function tokenizes an SVG path string into the
+    same form.
+    """
     if isinstance(path, str):
         commands: List[List[Any]] = []
         for token in _PATH_TOKEN_RE.findall(path):
@@ -687,12 +831,19 @@ def _path_commands(path: Any) -> List[List[Any]]:
             elif commands:
                 commands[-1].append(float(token))
         return commands
-    return [list(seg) for seg in (path or []) if isinstance(seg, (list, tuple)) and seg]
+    return [
+        list(seg)
+        for seg in (path or [])
+        if isinstance(seg, (list, tuple)) and seg
+    ]
 
 
 def _parse_fabric_path(path: Any) -> List[List[Segment]]:
-    """Fabric path data -> subpaths of absolute segments. Fabric itself
-    stores absolute M/L/Q/C/Z; relative commands and H/V are read too."""
+    """
+    Convert Fabric path data to subpaths of absolute segments. Fabric stores
+    absolute M/L/Q/C/Z itself. The function also reads relative commands and
+    H/V.
+    """
     subpaths: List[List[Segment]] = []
     current: Optional[List[Segment]] = None
     cur: Optional[Point] = None
@@ -703,11 +854,18 @@ def _parse_fabric_path(path: Any) -> List[List[Segment]]:
         upper = cmd.upper()
         arity = _PATH_ARITY.get(upper)
         if arity is None:
-            print(f"warning: unsupported path command {cmd!r} in a Kitsu eraser, skipping it",
-                  file=sys.stderr)
+            _warn(
+                f"unsupported path command {cmd!r} in a Kitsu eraser, "
+                f"skipping it"
+            )
             continue
         if upper == "Z":
-            if current is not None and cur is not None and start is not None and cur != start:
+            if (
+                current is not None
+                and cur is not None
+                and start is not None
+                and cur != start
+            ):
                 current.append(("L", start))
             cur, current = start, None
             continue
@@ -717,7 +875,7 @@ def _parse_fabric_path(path: Any) -> List[List[Segment]]:
             continue
 
         for i in range(0, len(nums) - arity + 1, arity):
-            group = nums[i:i + arity]
+            group = nums[i : i + arity]
             kind = "L" if (upper == "M" and i > 0) else upper
             ox, oy = cur if (cmd.islower() and cur is not None) else (0.0, 0.0)
 
@@ -748,13 +906,31 @@ def _parse_fabric_path(path: Any) -> List[List[Segment]]:
                 current.append(("Q", pt(group[0], group[1]), p))
             else:  # "C"
                 p = pt(group[4], group[5])
-                current.append(("C", pt(group[0], group[1]), pt(group[2], group[3]), p))
+                current.append(
+                    ("C", pt(group[0], group[1]), pt(group[2], group[3]), p)
+                )
             cur = p
     return subpaths
 
 
+def _quad_extrema(a: float, c: float, b: float) -> List[float]:
+    """
+    Return the interior extreme values of a 1-D quadratic Bezier a -> (ctl c)
+    -> b.
+    """
+    denom = a - 2.0 * c + b
+    if denom == 0:
+        return []
+    t = (a - c) / denom
+    if 0.0 < t < 1.0:
+        return [(1 - t) ** 2 * a + 2 * (1 - t) * t * c + t * t * b]
+    return []
+
+
 def _cubic_extrema(p0: float, p1: float, p2: float, p3: float) -> List[float]:
-    """Interior extreme values of a 1-D cubic Bezier."""
+    """
+    Return the interior extreme values of a 1-D cubic Bezier.
+    """
     d0, d1, d2 = p1 - p0, p2 - p1, p3 - p2
     a, b, c = d0 - 2.0 * d1 + d2, 2.0 * (d1 - d0), d0
     if abs(a) < 1e-12:
@@ -767,14 +943,22 @@ def _cubic_extrema(p0: float, p1: float, p2: float, p3: float) -> List[float]:
             sq = math.sqrt(disc)
             roots = [(-b + sq) / (2.0 * a), (-b - sq) / (2.0 * a)]
     return [
-        (1 - t) ** 3 * p0 + 3 * (1 - t) ** 2 * t * p1 + 3 * (1 - t) * t * t * p2 + t ** 3 * p3
-        for t in roots if 0.0 < t < 1.0
+        (1 - t) ** 3 * p0
+        + 3 * (1 - t) ** 2 * t * p1
+        + 3 * (1 - t) * t * t * p2
+        + t**3 * p3
+        for t in roots
+        if 0.0 < t < 1.0
     ]
 
 
-def _path_bounds(subpaths: Sequence[Sequence[Segment]]) -> Tuple[float, float, float, float]:
-    """(minX, minY, width, height) of the curves, as Fabric computes a
-    path's size and its pathOffset (the centre of these bounds)."""
+def _path_bounds(
+    subpaths: Sequence[Sequence[Segment]],
+) -> Tuple[float, float, float, float]:
+    """
+    Return (minX, minY, width, height) of the curves, as Fabric computes the
+    size of a path and its pathOffset (the centre of these bounds).
+    """
     xs: List[float] = []
     ys: List[float] = []
     for subpath in subpaths:
@@ -798,15 +982,19 @@ def _path_bounds(subpaths: Sequence[Sequence[Segment]]) -> Tuple[float, float, f
 def _bezier_point(ctl: Sequence[Point], t: float) -> Point:
     pts = list(ctl)
     while len(pts) > 1:
-        pts = [((1 - t) * a[0] + t * b[0], (1 - t) * a[1] + t * b[1])
-               for a, b in zip(pts, pts[1:])]
+        pts = [
+            ((1 - t) * a[0] + t * b[0], (1 - t) * a[1] + t * b[1])
+            for a, b in zip(pts, pts[1:])
+        ]
     return pts[0]
 
 
 def _flatten_subpath(subpath: Sequence[Segment]) -> List[Point]:
-    """A subpath as a polyline, in the path's own coordinates. The sampling
-    depends only on the path data, so copies of the same eraser stroke on
-    different objects flatten to the same points."""
+    """
+    Return a subpath as a polyline, in the coordinates of the path. The
+    sampling depends only on the path data. So copies of the same eraser stroke
+    on different objects flatten to the same points.
+    """
     cur = subpath[0][1]
     points = [cur]
     for seg in subpath[1:]:
@@ -814,25 +1002,39 @@ def _flatten_subpath(subpath: Sequence[Segment]) -> List[Point]:
         if seg[0] != "L":
             ctl = [cur, *seg[1:]]
             length = sum(math.dist(a, b) for a, b in zip(ctl, ctl[1:]))
-            steps = max(1, min(FLATTEN_MAX_STEPS, math.ceil(length / FLATTEN_STEP_PX)))
-            points.extend(_bezier_point(ctl, i / steps) for i in range(1, steps))
+            steps = max(
+                1, min(FLATTEN_MAX_STEPS, math.ceil(length / FLATTEN_STEP_PX))
+            )
+            points.extend(
+                _bezier_point(ctl, i / steps) for i in range(1, steps)
+            )
         points.append(p)
         cur = p
     return points
 
 
 def _brush_path_commands(points: Sequence[Point]) -> List[List[Any]]:
-    """A polyline as the path data Fabric's pencil/eraser brush makes from
-    its points: quadratic curves through the midpoints of the segments,
-    each controlled by the raw point between them, ending on the last."""
+    """
+    Return a polyline as the path data that the pencil/eraser brush of Fabric
+    makes from its points: quadratic curves through the midpoints of the
+    segments. The raw point between two midpoints controls each curve. The path
+    ends on the last point.
+    """
     pts = [(_clean(x, 4), _clean(y, 4)) for x, y in points]
     if len(pts) == 1:
         return [["M", *pts[0]], ["L", *pts[0]]]
     commands: List[List[Any]] = [["M", *pts[0]]]
     for p1, p2 in zip(pts, pts[1:]):
         if p1 != p2:
-            commands.append(["Q", p1[0], p1[1],
-                             _clean((p1[0] + p2[0]) / 2.0, 4), _clean((p1[1] + p2[1]) / 2.0, 4)])
+            commands.append(
+                [
+                    "Q",
+                    p1[0],
+                    p1[1],
+                    _clean((p1[0] + p2[0]) / 2.0, 4),
+                    _clean((p1[1] + p2[1]) / 2.0, 4),
+                ]
+            )
     commands.append(["L", *pts[-1]])
     return commands
 
@@ -841,48 +1043,65 @@ def _brush_path_commands(points: Sequence[Point]) -> List[List[Any]]:
 # Erasers
 # ---------------------------------------------------------------------------
 #
-# An eraser stroke is handled as {"points": [(x, y), ...], "width": w}, in
+# An eraser stroke is a dict {"points": [(x, y), ...], "width": w}. Units are
 # canvas px on the Kitsu side and RV units on the RV side.
 
+
 def _is_erasable(obj: Dict[str, Any]) -> bool:
-    """Kitsu text is drawn with erasable=False; erasers never cut it."""
+    """
+    Kitsu draws text with erasable=False. Erasers never cut it.
+    """
     return obj.get("erasable", True) is not False
 
 
-def _same_eraser_stroke(a: Dict[str, Any], b: Dict[str, Any], tol: float) -> bool:
+def _same_eraser_stroke(
+    a: Dict[str, Any], b: Dict[str, Any], tol: float
+) -> bool:
     pa, pb = a["points"], b["points"]
     if len(pa) != len(pb) or not pa or abs(a["width"] - b["width"]) > tol:
         return False
-    return all(abs(xa - xb) <= tol and abs(ya - yb) <= tol
-               for (xa, ya), (xb, yb) in zip(pa, pb))
+    return all(
+        abs(xa - xb) <= tol and abs(ya - yb) <= tol
+        for (xa, ya), (xb, yb) in zip(pa, pb)
+    )
 
 
-def _fabric_path_strokes(path_obj: Dict[str, Any], parent: Matrix) -> List[Dict[str, Any]]:
-    """An eraser path as canvas-px strokes, one per subpath. `parent` maps
-    the plane the path sits in (its eraser group's) to the canvas."""
+def _fabric_path_strokes(
+    path_obj: Dict[str, Any], parent: Matrix
+) -> List[Dict[str, Any]]:
+    """
+    Return an eraser path as canvas-px strokes, one for each subpath. `parent`
+    maps the plane of the path (the plane of its eraser group) to the canvas.
+    """
     subpaths = _parse_fabric_path(path_obj.get("path"))
     if not subpaths:
         return []
     min_x, min_y, w, h = _path_bounds(subpaths)
-    # Fabric draws a path's data offset by its pathOffset (the centre of
-    # its bounds), from the path object's own centre.
+    # Fabric draws the path data with an offset of pathOffset (the centre of
+    # its bounds), from the own centre of the path object.
     total = _mat_mul(
         _mat_mul(parent, _fabric_matrix(path_obj, (w, h))),
         _mat_translate(-(min_x + w / 2.0), -(min_y + h / 2.0)),
     )
-    width_px = float(path_obj.get("strokeWidth") or 0) * _mat_scale_factor(total)
+    width_px = float(path_obj.get("strokeWidth") or 0) * _mat_scale_factor(
+        total
+    )
     strokes = []
     for subpath in subpaths:
-        points = [_mat_apply(total, x, y) for x, y in _flatten_subpath(subpath)]
+        points = [
+            _mat_apply(total, x, y) for x, y in _flatten_subpath(subpath)
+        ]
         if points:
             strokes.append({"points": points, "width": width_px})
     return strokes
 
 
 def _fabric_eraser_entries(obj: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """The eraser paths stored on a Kitsu object, in the order they were
-    made: [{"path": path object, "direct": a direct child of the eraser
-    group, "strokes": its strokes in canvas px}, ...]."""
+    """
+    Return the eraser paths stored on a Kitsu object, in the order that Kitsu
+    made them: [{"path": path object, "direct": a direct child of the eraser
+    group, "strokes": its strokes in canvas px}, ...].
+    """
     eraser = obj.get("eraser")
     if not isinstance(eraser, dict):
         return []
@@ -894,29 +1113,42 @@ def _fabric_eraser_entries(obj: Dict[str, Any]) -> List[Dict[str, Any]]:
             if not isinstance(child, dict):
                 continue
             if child.get("type") == "path":
-                operation = child.get("globalCompositeOperation") or KITSU_ERASE_OPERATION
+                operation = (
+                    child.get("globalCompositeOperation")
+                    or KITSU_ERASE_OPERATION
+                )
                 if operation != KITSU_ERASE_OPERATION:
-                    # Fabric's "inverted" eraser restores what was erased;
+                    # The "inverted" eraser of Fabric restores what it erased.
                     # RV has nothing like it.
-                    print(f"warning: skipping eraser path on {obj.get('id')!r} drawn with "
-                          f"{operation!r}; OpenRV erasers can only erase", file=sys.stderr)
+                    _warn(
+                        f"skipping eraser path on {obj.get('id')!r} drawn "
+                        f"with "
+                        f"{operation!r}; OpenRV erasers can only erase"
+                    )
                     continue
                 strokes = _fabric_path_strokes(child, matrix)
                 if strokes:
-                    entries.append({"path": child, "direct": direct, "strokes": strokes})
+                    entries.append(
+                        {"path": child, "direct": direct, "strokes": strokes}
+                    )
             elif isinstance(child.get("objects"), list):
                 walk(child, matrix, False)
             else:
-                print(f"warning: skipping unsupported {child.get('type')!r} in the eraser "
-                      f"of {obj.get('id')!r}", file=sys.stderr)
+                _warn(
+                    f"skipping unsupported {child.get('type')!r} in the "
+                    f"eraser "
+                    f"of {obj.get('id')!r}"
+                )
 
     walk(eraser, _fabric_matrix(obj), True)
     return entries
 
 
 def _new_eraser_group(obj: Dict[str, Any]) -> Dict[str, Any]:
-    """An empty eraser group for `obj`, as Kitsu makes them: centred on the
-    object, the size of its stroke-inclusive box."""
+    """
+    Return an empty eraser group for `obj`, as Kitsu makes them: it is centred
+    on the object and has the size of the stroke-inclusive box of the object.
+    """
     w, h = _fabric_size(obj)
     sw = float(obj.get("strokeWidth") or 0)
     return {
@@ -959,17 +1191,23 @@ def _new_eraser_group(obj: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _build_eraser_path(stroke: Dict[str, Any], parent: Matrix) -> Dict[str, Any]:
-    """A canvas-px eraser stroke -> a Fabric eraser path for a group whose
-    plane `parent` maps to the canvas. Like Kitsu's, the path data stays in
-    canvas coordinates and the path's own transform cancels the object's."""
+def _build_eraser_path(
+    stroke: Dict[str, Any], parent: Matrix
+) -> Dict[str, Any]:
+    """
+    Convert a canvas-px eraser stroke to a Fabric eraser path for a group. The
+    plane `parent` of the group maps to the canvas. As in Kitsu, the path data
+    stays in canvas coordinates. The transform of the path cancels the
+    transform of the object.
+    """
     commands = _brush_path_commands(stroke["points"])
     min_x, min_y, w, h = _path_bounds(_parse_fabric_path(commands))
     offset = (min_x + w / 2.0, min_y + h / 2.0)
 
-    # The path's matrix M must satisfy parent * M * T(-offset) = identity.
+    # The matrix M of the path must satisfy parent * M * T(-offset) = identity.
     angle, sx, sy, skew_x, cx, cy = _qr_decompose(
-        _mat_mul(_mat_inv(parent), _mat_translate(*offset)))
+        _mat_mul(_mat_inv(parent), _mat_translate(*offset))
+    )
     sw = _clean(stroke["width"])
     box_w, box_h = (w + sw) * abs(sx), (h + sw) * abs(sy)
     a = math.radians(angle)
@@ -1015,10 +1253,14 @@ def _build_eraser_path(stroke: Dict[str, Any], parent: Matrix) -> Dict[str, Any]
 
 
 def _strokes_match_entries(
-    strokes: Sequence[Dict[str, Any]], entries: Sequence[Dict[str, Any]], tol: float,
+    strokes: Sequence[Dict[str, Any]],
+    entries: Sequence[Dict[str, Any]],
+    tol: float,
 ) -> bool:
-    """True if `strokes` are exactly the strokes of `entries`, in any order
-    (erasers cutting the same object can be applied in either order)."""
+    """
+    Return True if `strokes` are exactly the strokes of `entries`, in any order
+    (erasers that cut the same object can be applied in either order).
+    """
     pool = [s for entry in entries for s in entry["strokes"]]
     if len(pool) != len(strokes):
         return False
@@ -1034,14 +1276,19 @@ def _strokes_match_entries(
 
 
 def _resolve_eraser(
-    obj: Dict[str, Any], ref: Optional[Dict[str, Any]], strokes: Sequence[Dict[str, Any]],
+    obj: Dict[str, Any],
+    ref: Optional[Dict[str, Any]],
+    strokes: Sequence[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """The Kitsu object to send for a converted shape: `obj` (or `ref`, the
-    existing Kitsu object it is an unchanged copy of) with an eraser made of
-    `strokes`, the RV eraser strokes (canvas px) that cut it.
+    """
+    Return the Kitsu object to send for a converted shape. It is `obj` (or
+    `ref`, the Kitsu object of which `obj` is an unchanged copy) with an eraser
+    made of `strokes`. `strokes` are the RV eraser strokes (canvas px) that cut
+    it.
 
-    An unchanged eraser is kept as it is on Kitsu. A changed one is rebuilt,
-    reusing the paths of strokes that were already there."""
+    An unchanged eraser stays as it is on Kitsu. The function rebuilds a
+    changed eraser. It reuses the paths of the strokes that were already there.
+    """
     tol = MATCH_TOLERANCE_PX
     ref_entries: List[Dict[str, Any]] = []
     group: Optional[Dict[str, Any]] = None
@@ -1068,9 +1315,14 @@ def _resolve_eraser(
     while i < len(strokes):
         for k, entry in enumerate(reusable):
             n = len(entry["strokes"])
-            if not used[k] and n and i + n <= len(strokes) and all(
-                _same_eraser_stroke(s, r, tol)
-                for s, r in zip(strokes[i:i + n], entry["strokes"])
+            if (
+                not used[k]
+                and n
+                and i + n <= len(strokes)
+                and all(
+                    _same_eraser_stroke(s, r, tol)
+                    for s, r in zip(strokes[i : i + n], entry["strokes"])
+                )
             ):
                 used[k] = True
                 paths.append(copy.deepcopy(entry["path"]))
@@ -1085,38 +1337,51 @@ def _resolve_eraser(
 
 
 def _is_rv_eraser(shape: Dict[str, Any]) -> bool:
-    """True for an RV pen drawn in erase mode."""
+    """
+    Return True for an RV pen drawn in erase mode.
+    """
     if shape.get("type") != "pen":
         return False
-    mode = _rv_scalar(shape.get("properties", {}).get("mode"), RV_PEN_MODE_PAINT)
+    mode = _rv_scalar(
+        shape.get("properties", {}).get("mode"), RV_PEN_MODE_PAINT
+    )
     return mode == RV_PEN_MODE_ERASE
 
 
 def _rv_eraser_stroke(
-    shape: Dict[str, Any], width: int, height: int,
-    canvas_width: float, canvas_height: float,
+    shape: Dict[str, Any],
+    space: _PaintSpace,
 ) -> Optional[Dict[str, Any]]:
-    """An RV eraser pen as a canvas-px stroke, or None if it has no points.
-    Fabric eraser paths have one width, so the widest point's is used."""
+    """
+    Return an RV eraser pen as a canvas-px stroke, or None if it has no points.
+    Fabric eraser paths have one width, so the function uses the width of the
+    widest point.
+    """
     props = shape["properties"]
     points = [
         (_clean(x), _clean(y))
         for x, y in (
-            rv_normalized_to_pixel(nx, ny, width, height, canvas_width, canvas_height)
+            rv_normalized_to_pixel(nx, ny, space)
             for nx, ny in (props.get("points") or [])
         )
     ]
     if not points:
         return None
     width_px = max(
-        rv_width_to_px(w, canvas_height)
+        rv_width_to_px(w, space.canvas_height)
         for w in _per_point_widths(props.get("width"), len(points))
     )
-    return {"points": points, "width": width_px, "bbox": _points_bbox(points, width_px / 2.0)}
+    return {
+        "points": points,
+        "width": width_px,
+        "bbox": _points_bbox(points, width_px / 2.0),
+    }
 
 
 def _eraser_pen(eraser: Dict[str, Any], frame_num: int) -> Dict[str, Any]:
-    """An RV eraser pen shape for a deduplicated Kitsu eraser stroke."""
+    """
+    Return an RV eraser pen shape for a deduplicated Kitsu eraser stroke.
+    """
     return {
         "type": "pen",
         "frame": frame_num,
@@ -1132,18 +1397,23 @@ def _eraser_pen(eraser: Dict[str, Any], frame_num: int) -> Dict[str, Any]:
 
 
 def _order_with_erasers(
-    items: Sequence[Dict[str, Any]], erasers: Sequence[Dict[str, Any]], frame_num: int,
+    items: Sequence[Dict[str, Any]],
+    erasers: Sequence[Dict[str, Any]],
+    frame_num: int,
 ) -> List[Dict[str, Any]]:
-    """Interleave a frame's converted shapes with its eraser pens.
+    """
+    Interleave the converted shapes of a frame with its eraser pens.
 
-    An RV eraser cuts everything drawn before it, so it has to come after
-    every object it erased in Kitsu and before every object it overlaps
-    but didn't erase (drawn after it, or not erasable, like text). Kitsu
-    also moves an object to the end of its frame when it's updated, e.g.
-    by erasing it, so the stored order alone can't be relied on.
+    An RV eraser cuts everything drawn before it. So it must come after every
+    object that it erased in Kitsu. It must come before every object that it
+    overlaps but did not erase (drawn after it, or not erasable, like text).
+    Kitsu also moves an object to the end of its frame when it updates the
+    object, for example by erasing it. So the function cannot rely on the
+    stored order alone.
 
-    Within those rules the Kitsu order is kept: each eraser sits right
-    after the last object it erased."""
+    Within these rules, the function keeps the Kitsu order: each eraser sits
+    right after the last object that it erased.
+    """
     if not erasers:
         return [item["shape"] for item in items]
 
@@ -1165,7 +1435,9 @@ def _order_with_erasers(
             obj_key = (item["index"], 0, 0)
             if item["index"] in eraser["attached"]:
                 add_edge(obj_key, key)
-            elif item["bbox"] is not None and _boxes_overlap(item["bbox"], eraser["bbox"]):
+            elif item["bbox"] is not None and _boxes_overlap(
+                item["bbox"], eraser["bbox"]
+            ):
                 add_edge(key, obj_key)
 
     heap = [key for key in nodes if not indeg.get(key)]
@@ -1174,11 +1446,13 @@ def _order_with_erasers(
     order: List[Dict[str, Any]] = []
     while remaining:
         if not heap:
-            # Contradictory erasers (each must cut the other's object but
-            # spare its own): keep the Kitsu order for the rest.
+            # Contradictory erasers (each must cut the object of the other but
+            # spare its own object): keep the Kitsu order for the rest.
             key = min(remaining)
-            print(f"warning: erasers on frame {frame_num} can't all be ordered so "
-                  f"they cut only what they cut in Kitsu", file=sys.stderr)
+            _warn(
+                f"erasers on frame {frame_num} can't all be ordered so "
+                f"they cut only what they cut in Kitsu"
+            )
         else:
             key = heapq.heappop(heap)
             if key not in remaining:
@@ -1193,12 +1467,14 @@ def _order_with_erasers(
 
 
 def _norm_box(
-    box: Sequence[float], width: int, height: int,
-    canvas_width: float, canvas_height: float,
+    box: Sequence[float],
+    space: _PaintSpace,
 ) -> Tuple[float, float, float, float]:
-    """A canvas-px box in RV normalized coordinates (still min/max)."""
-    x0, y0 = pixel_to_rv_normalized(box[0], box[1], width, height, canvas_width, canvas_height)
-    x1, y1 = pixel_to_rv_normalized(box[2], box[3], width, height, canvas_width, canvas_height)
+    """
+    Return a canvas-px box in RV normalized coordinates (still min/max).
+    """
+    x0, y0 = pixel_to_rv_normalized(box[0], box[1], space)
+    x1, y1 = pixel_to_rv_normalized(box[2], box[3], space)
     return min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)
 
 
@@ -1206,15 +1482,25 @@ def _norm_box(
 # OpenRV -> Kitsu
 # ---------------------------------------------------------------------------
 
+
 def _fabric_base(
     obj_type: str,
-    left: float, top: float, width: float, height: float,
-    stroke_hex: str, stroke_width: float, opacity: float,
-    author: str, canvas_width: float, canvas_height: float,
+    left: float,
+    top: float,
+    width: float,
+    height: float,
+    stroke_hex: str,
+    stroke_width: float,
+    opacity: float,
+    author: str,
+    canvas_width: float,
+    canvas_height: float,
     source_uuid: Optional[str],
 ) -> Dict[str, Any]:
-    """The Fabric.js boilerplate every converted object shares, regardless
-    of shape type."""
+    """
+    Return the Fabric.js boilerplate that all converted objects share, for any
+    shape type.
+    """
     return {
         "id": source_uuid or str(uuid.uuid4()),
         "type": obj_type,
@@ -1255,22 +1541,14 @@ def _fabric_base(
     }
 
 
-def _quad_extrema(a: float, c: float, b: float) -> List[float]:
-    """Interior extreme values of a 1-D quadratic Bezier a -> (ctl c) -> b."""
-    denom = a - 2.0 * c + b
-    if denom == 0:
-        return []
-    t = (a - c) / denom
-    if 0.0 < t < 1.0:
-        return [(1 - t) ** 2 * a + 2 * (1 - t) * t * c + t * t * b]
-    return []
-
-
-def _psstroke_bounds(points: Sequence[Point]) -> Tuple[float, float, float, float]:
-    """(minX, minY, width, height) exactly as fabricjs-psbrush's
-    PSStroke._parseDimensions computes them: the stroke is drawn as
-    quadratic curves between point midpoints, so the bounds are those of
-    the curves (the last raw point is never reached), not of the points.
+def _psstroke_bounds(
+    points: Sequence[Point],
+) -> Tuple[float, float, float, float]:
+    """
+    Return (minX, minY, width, height) exactly as PSStroke._parseDimensions of
+    fabricjs-psbrush computes them. The stroke is drawn as quadratic curves
+    between point midpoints. So the bounds are the bounds of the curves, not of
+    the points (the curves never reach the last raw point).
     """
     n = len(points)
     if n == 0:
@@ -1296,38 +1574,24 @@ def _psstroke_bounds(points: Sequence[Point]) -> Tuple[float, float, float, floa
     return min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)
 
 
-def _per_point_widths(raw: Any, count: int) -> List[float]:
-    """RV pen "width" as one value per point. RV stores one entry per point
-    (pressure-modulated), but older data may hold a single value or a bare
-    float."""
-    if isinstance(raw, (int, float)):
-        widths = [float(raw)]
-    else:
-        widths = [float(w) for w in (raw or [])]
-    if not widths:
-        widths = [0.01]
-    if len(widths) < count:
-        widths += [widths[-1]] * (count - len(widths))
-    return widths[:count]
-
-
 def _pen_to_fabric(
-    shape: Dict[str, Any], width: int, height: int,
-    canvas_width: float, canvas_height: float,
-    author: str, clock_ms: List[int],
+    shape: Dict[str, Any],
+    space: _PaintSpace,
+    author: str,
+    clock_ms: List[int],
 ) -> Dict[str, Any]:
     props = shape["properties"]
     points_px = [
-        rv_normalized_to_pixel(nx, ny, width, height, canvas_width, canvas_height)
-        for nx, ny in props["points"]
+        rv_normalized_to_pixel(nx, ny, space) for nx, ny in props["points"]
     ]
     points_px = [(_clean(x), _clean(y)) for x, y in points_px]
 
     # psbrush renders each segment at pressure * strokeWidth. RV keeps that
-    # product per point, so split it back into a base width (the widest
-    # point) and a 0..1 pressure per point. The rendered width is identical.
+    # product for each point. So split it back into a base width (the widest
+    # point) and a 0..1 pressure for each point. The rendered width is the
+    # same.
     widths_px = [
-        rv_width_to_px(w, canvas_height)
+        rv_width_to_px(w, space.canvas_height)
         for w in _per_point_widths(props.get("width"), len(points_px))
     ]
     stroke_width_px = _clean(max(widths_px) if widths_px else 1.0)
@@ -1337,8 +1601,8 @@ def _pen_to_fabric(
     ]
 
     min_x, min_y, bbox_w, bbox_h = _psstroke_bounds(points_px)
-    # psbrush positions the object by its stroke-inclusive box, so left/top
-    # sit half a stroke width outside the curve bounds.
+    # psbrush positions the object by its stroke-inclusive box. So left/top are
+    # half a stroke width outside the curve bounds.
     left = min_x - stroke_width_px / 2.0
     top = min_y - stroke_width_px / 2.0
 
@@ -1348,10 +1612,17 @@ def _pen_to_fabric(
     clock_ms[0] = end_time
 
     obj = _fabric_base(
-        "PSStroke", _clean(left), _clean(top), _clean(bbox_w), _clean(bbox_h),
-        rv_color_to_hex(props.get("color", [])), stroke_width_px,
+        "PSStroke",
+        _clean(left),
+        _clean(top),
+        _clean(bbox_w),
+        _clean(bbox_h),
+        rv_color_to_hex(props.get("color", [])),
+        stroke_width_px,
         _clean(rv_alpha(props.get("color", [])), 6),
-        author, canvas_width, canvas_height,
+        author,
+        space.canvas_width,
+        space.canvas_height,
         props.get("uuid"),
     )
     obj["startTime"] = start_time
@@ -1364,28 +1635,36 @@ def _pen_to_fabric(
 
 
 def _line_to_fabric(
-    shape: Dict[str, Any], width: int, height: int,
-    canvas_width: float, canvas_height: float,
-    author: str, clock_ms: List[int],
+    shape: Dict[str, Any],
+    space: _PaintSpace,
+    author: str,
+    clock_ms: List[int],
 ) -> Dict[str, Any]:
     props = shape["properties"]
     (sx, sy), (ex, ey) = props["startPos"][0], props["endPos"][0]
-    x1, y1 = rv_normalized_to_pixel(sx, sy, width, height, canvas_width, canvas_height)
-    x2, y2 = rv_normalized_to_pixel(ex, ey, width, height, canvas_width, canvas_height)
+    x1, y1 = rv_normalized_to_pixel(sx, sy, space)
+    x2, y2 = rv_normalized_to_pixel(ex, ey, space)
 
     left, top = min(x1, x2), min(y1, y2)
     bbox_w, bbox_h = abs(x2 - x1), abs(y2 - y1)
-    stroke_width_px = props.get("borderWidth", 0.01) * canvas_height
+    stroke_width_px = props.get("borderWidth", 0.01) * space.canvas_height
 
     start_time = clock_ms[0]
     end_time = start_time + MS_PER_STROKE_POINT * 2
     clock_ms[0] = end_time
 
     obj = _fabric_base(
-        "line", left, top, bbox_w, bbox_h,
-        rv_color_to_hex(props.get("borderColor", [])), round(stroke_width_px, 2),
+        "line",
+        left,
+        top,
+        bbox_w,
+        bbox_h,
+        rv_color_to_hex(props.get("borderColor", [])),
+        round(stroke_width_px, 2),
         rv_alpha(props.get("borderColor", [])),
-        author, canvas_width, canvas_height,
+        author,
+        space.canvas_width,
+        space.canvas_height,
         props.get("uuid"),
     )
     obj["startTime"] = start_time
@@ -1394,39 +1673,68 @@ def _line_to_fabric(
     return obj
 
 
+def _kitsu_shape_style(clock_ms: List[int]) -> Dict[str, Any]:
+    """
+    Return the fields that Kitsu writes on the shapes it draws (not on brush
+    strokes). Each call uses one tick of `clock_ms`, so the timestamps stay
+    different.
+    """
+    style = {
+        "strokeLineCap": "butt",
+        "strokeLineJoin": "miter",
+        "strokeMiterLimit": 4,
+        "createdAt": _iso_ms(clock_ms[0]),
+    }
+    clock_ms[0] += 1
+    return style
+
+
 def _rv_box_px(
-    props: Dict[str, Any], width: int, height: int,
-    canvas_width: float, canvas_height: float,
+    props: Dict[str, Any],
+    space: _PaintSpace,
 ) -> Tuple[float, float, float, float, Any]:
-    """(x0, y0, x1, y1, stroke width) in canvas px of an RV ellipse or rect,
-    which RV stores as the axis-aligned min/max corners of the box its
-    outline is centred on. x0/y0 is the canvas top-left corner."""
-    p0 = rv_normalized_to_pixel(*props["min"][0], width, height, canvas_width, canvas_height)
-    p1 = rv_normalized_to_pixel(*props["max"][0], width, height, canvas_width, canvas_height)
+    """
+    Return (x0, y0, x1, y1, stroke width) in canvas px of an RV ellipse or
+    rect. RV stores it as the axis-aligned min/max corners of the box on which
+    its outline is centred. x0/y0 is the top-left corner of the canvas.
+    """
+    p0 = rv_normalized_to_pixel(*props["min"][0], space)
+    p1 = rv_normalized_to_pixel(*props["max"][0], space)
     x0, x1 = sorted((p0[0], p1[0]))
     y0, y1 = sorted((p0[1], p1[1]))
-    stroke_width_px = _clean(rv_width_to_px(props.get("borderWidth", 0.01), canvas_height))
+    stroke_width_px = _clean(
+        rv_width_to_px(props.get("borderWidth", 0.01), space.canvas_height)
+    )
     return x0, y0, x1, y1, stroke_width_px
 
 
 def _rv_fill(props: Dict[str, Any]) -> str:
-    """Fabric "fill" for an RV innerColor ("transparent" when it has none)."""
+    """
+    Return the Fabric "fill" for an RV innerColor ("transparent" when it has
+    none).
+    """
     inner = props.get("innerColor")
-    return rv_color_to_hex(inner) if inner and rv_alpha(inner) > 0 else "transparent"
+    return (
+        rv_color_to_hex(inner)
+        if inner and rv_alpha(inner) > 0
+        else "transparent"
+    )
 
 
 def _ellipse_to_fabric(
-    shape: Dict[str, Any], width: int, height: int,
-    canvas_width: float, canvas_height: float,
-    author: str, clock_ms: List[int],
+    shape: Dict[str, Any],
+    space: _PaintSpace,
+    author: str,
+    clock_ms: List[int],
 ) -> Dict[str, Any]:
-    """RV "ellipse" (axis-aligned, given by its min/max corners) -> the
-    Fabric "circle" Kitsu draws ellipses with. A non-round ellipse becomes
-    a circle of the larger radius squashed with scaleX/scaleY, with
-    strokeUniform on so the outline stays the same thickness all round."""
+    """
+    Convert an RV "ellipse" (axis-aligned, given by its min/max corners) to the
+    Fabric "circle" that Kitsu uses to draw ellipses. A non-round ellipse
+    becomes a circle of the larger radius, squashed with scaleX/scaleY.
+    strokeUniform is on, so the outline keeps the same thickness all round.
+    """
     props = shape["properties"]
-    x0, y0, x1, y1, stroke_width_px = _rv_box_px(
-        props, width, height, canvas_width, canvas_height)
+    x0, y0, x1, y1, stroke_width_px = _rv_box_px(props, space)
     cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
     rx, ry = (x1 - x0) / 2.0, (y1 - y0) / 2.0
 
@@ -1443,68 +1751,82 @@ def _ellipse_to_fabric(
 
     border = props.get("borderColor", [])
     obj = _fabric_base(
-        "circle", _clean(cx - box_w / 2.0), _clean(cy - box_h / 2.0),
-        _clean(diameter), _clean(diameter),
-        rv_color_to_hex(border), stroke_width_px, _clean(rv_alpha(border), 6),
-        author, canvas_width, canvas_height,
+        "circle",
+        _clean(cx - box_w / 2.0),
+        _clean(cy - box_h / 2.0),
+        _clean(diameter),
+        _clean(diameter),
+        rv_color_to_hex(border),
+        stroke_width_px,
+        _clean(rv_alpha(border), 6),
+        author,
+        space.canvas_width,
+        space.canvas_height,
         props.get("uuid"),
     )
-    obj.update({
-        "fill": _rv_fill(props),
-        "radius": _clean(radius),
-        "scaleX": _clean(scale_x, 6),
-        "scaleY": _clean(scale_y, 6),
-        "startAngle": 0,
-        "endAngle": 360,
-        "counterClockwise": False,
-        "strokeUniform": uniform_stroke,
-        "strokeLineCap": "butt",
-        "strokeLineJoin": "miter",
-        "strokeMiterLimit": 4,
-        "createdAt": _iso_ms(clock_ms[0]),
-    })
-    clock_ms[0] += 1
+    obj.update(
+        {
+            "fill": _rv_fill(props),
+            "radius": _clean(radius),
+            "scaleX": _clean(scale_x, 6),
+            "scaleY": _clean(scale_y, 6),
+            "startAngle": 0,
+            "endAngle": 360,
+            "counterClockwise": False,
+            "strokeUniform": uniform_stroke,
+            **_kitsu_shape_style(clock_ms),
+        }
+    )
     return obj
 
 
 def _rect_to_fabric(
-    shape: Dict[str, Any], width: int, height: int,
-    canvas_width: float, canvas_height: float,
-    author: str, clock_ms: List[int],
+    shape: Dict[str, Any],
+    space: _PaintSpace,
+    author: str,
+    clock_ms: List[int],
 ) -> Dict[str, Any]:
-    """RV "rect" (axis-aligned, given by its min/max corners) -> a Fabric
-    "rect" as Kitsu draws it: unscaled, square-cornered, positioned by its
-    stroke-inclusive box, so left/top sit half a stroke outside the
-    outline's centre line."""
+    """
+    Convert an RV "rect" (axis-aligned, given by its min/max corners) to a
+    Fabric "rect" as Kitsu draws it: unscaled, square-cornered, and positioned
+    by its stroke-inclusive box. So left/top are half a stroke outside the
+    centre line of the outline.
+    """
     props = shape["properties"]
-    x0, y0, x1, y1, stroke_width_px = _rv_box_px(
-        props, width, height, canvas_width, canvas_height)
+    x0, y0, x1, y1, stroke_width_px = _rv_box_px(props, space)
     half_sw = stroke_width_px / 2.0
 
     border = props.get("borderColor", [])
     obj = _fabric_base(
-        "rect", _clean(x0 - half_sw), _clean(y0 - half_sw),
-        _clean(x1 - x0), _clean(y1 - y0),
-        rv_color_to_hex(border), stroke_width_px, _clean(rv_alpha(border), 6),
-        author, canvas_width, canvas_height,
+        "rect",
+        _clean(x0 - half_sw),
+        _clean(y0 - half_sw),
+        _clean(x1 - x0),
+        _clean(y1 - y0),
+        rv_color_to_hex(border),
+        stroke_width_px,
+        _clean(rv_alpha(border), 6),
+        author,
+        space.canvas_width,
+        space.canvas_height,
         props.get("uuid"),
     )
-    obj.update({
-        "fill": _rv_fill(props),
-        "rx": 0,
-        "ry": 0,
-        "strokeLineCap": "butt",
-        "strokeLineJoin": "miter",
-        "strokeMiterLimit": 4,
-        "createdAt": _iso_ms(clock_ms[0]),
-    })
-    clock_ms[0] += 1
+    obj.update(
+        {
+            "fill": _rv_fill(props),
+            "rx": 0,
+            "ry": 0,
+            **_kitsu_shape_style(clock_ms),
+        }
+    )
     return obj
 
 
 def _rv_arrow_width(props: Dict[str, Any]) -> float:
-    """An RV arrow's line width in RV units. RV writes it twice, as
-    "thickness" and "borderWidth"; thickness wins when both are there."""
+    """
+    Return the line width of an RV arrow in RV units. RV writes it twice, as
+    "thickness" and "borderWidth". When both are present, thickness is used.
+    """
     for key in ("thickness", "borderWidth"):
         value = props.get(key)
         if isinstance(value, (list, tuple)):
@@ -1515,66 +1837,83 @@ def _rv_arrow_width(props: Dict[str, Any]) -> float:
 
 
 def _arrow_to_fabric(
-    shape: Dict[str, Any], width: int, height: int,
-    canvas_width: float, canvas_height: float,
-    author: str, clock_ms: List[int],
+    shape: Dict[str, Any],
+    space: _PaintSpace,
+    author: str,
+    clock_ms: List[int],
 ) -> Dict[str, Any]:
-    """RV "arrow" (tail startPos -> head endPos) -> a Kitsu "arrow": a
-    Fabric Line from x1/y1 (tail) to x2/y2 (head), positioned by its
-    stroke-inclusive box, so left/top sit half a stroke outside the ends."""
+    """
+    Convert an RV "arrow" (tail startPos -> head endPos) to a Kitsu "arrow": a
+    Fabric Line from x1/y1 (tail) to x2/y2 (head). It is positioned by its
+    stroke-inclusive box. So left/top are half a stroke outside the ends.
+    """
     props = shape["properties"]
-    x1, y1 = rv_normalized_to_pixel(*props["startPos"][0], width, height,
-                                    canvas_width, canvas_height)
-    x2, y2 = rv_normalized_to_pixel(*props["endPos"][0], width, height,
-                                    canvas_width, canvas_height)
-    stroke_width_px = _clean(rv_width_to_px(_rv_arrow_width(props), canvas_height))
+    x1, y1 = rv_normalized_to_pixel(*props["startPos"][0], space)
+    x2, y2 = rv_normalized_to_pixel(*props["endPos"][0], space)
+    stroke_width_px = _clean(
+        rv_width_to_px(_rv_arrow_width(props), space.canvas_height)
+    )
     half_sw = stroke_width_px / 2.0
 
     border = props.get("borderColor", [])
     obj = _fabric_base(
-        "arrow", _clean(min(x1, x2) - half_sw), _clean(min(y1, y2) - half_sw),
-        _clean(abs(x2 - x1)), _clean(abs(y2 - y1)),
-        rv_color_to_hex(border), stroke_width_px, _clean(rv_alpha(border), 6),
-        author, canvas_width, canvas_height,
+        "arrow",
+        _clean(min(x1, x2) - half_sw),
+        _clean(min(y1, y2) - half_sw),
+        _clean(abs(x2 - x1)),
+        _clean(abs(y2 - y1)),
+        rv_color_to_hex(border),
+        stroke_width_px,
+        _clean(rv_alpha(border), 6),
+        author,
+        space.canvas_width,
+        space.canvas_height,
         props.get("uuid"),
     )
-    obj.update({
-        "x1": _clean(x1),
-        "y1": _clean(y1),
-        "x2": _clean(x2),
-        "y2": _clean(y2),
-        "fill": "transparent",
-        "arrowHeadSize": KITSU_ARROW_HEAD_SIZE,
-        "arrowHeadWidth": KITSU_ARROW_HEAD_WIDTH,
-        "strokeLineCap": "butt",
-        "strokeLineJoin": "miter",
-        "strokeMiterLimit": 4,
-        "createdAt": _iso_ms(clock_ms[0]),
-    })
-    clock_ms[0] += 1
+    obj.update(
+        {
+            "x1": _clean(x1),
+            "y1": _clean(y1),
+            "x2": _clean(x2),
+            "y2": _clean(y2),
+            "fill": "transparent",
+            "arrowHeadSize": KITSU_ARROW_HEAD_SIZE,
+            "arrowHeadWidth": KITSU_ARROW_HEAD_WIDTH,
+            **_kitsu_shape_style(clock_ms),
+        }
+    )
     return obj
 
 
 def _text_to_fabric(
-    shape: Dict[str, Any], width: int, height: int,
-    canvas_width: float, canvas_height: float,
-    author: str, clock_ms: List[int],
+    shape: Dict[str, Any],
+    space: _PaintSpace,
+    author: str,
+    clock_ms: List[int],
 ) -> Optional[Dict[str, Any]]:
-    """RV "text" (anchored at the left end of its first baseline, sized as
-    a fraction of the image height) -> a Kitsu "i-text", positioned by the
-    top-left of its box as Fabric lays text out. Returns None for a text
-    with nothing in it (e.g. one placed in RV but never typed into)."""
+    """
+    Convert an RV "text" to a Kitsu "i-text". RV anchors the text at the left
+    end of its first baseline and sizes it as a fraction of the image height.
+    The "i-text" is positioned by the top-left of its box, as Fabric lays out
+    text. Return None for a text with nothing in it (for example, a text placed
+    in RV but never typed into).
+    """
     props = shape["properties"]
     text = _clean_text(props.get("text"))
     if not text.strip():
-        print(f"warning: skipping empty OpenRV text {shape.get('name')!r}", file=sys.stderr)
+        _warn(f"skipping empty OpenRV text {shape.get('name')!r}")
         return None
 
-    ax, ay = rv_normalized_to_pixel(*_rv_point(props["position"]), width, height,
-                                    canvas_width, canvas_height)
-    font_px = _clean(rv_width_to_px(_rv_text_font_size(props), canvas_height))
+    ax, ay = rv_normalized_to_pixel(
+        *_rv_point(props["position"]),
+        space,
+    )
+    font_px = _clean(
+        rv_width_to_px(_rv_text_font_size(props), space.canvas_height)
+    )
     lines = text.split("\n")
-    # Fabric's default strokeWidth, which pads the box of a stroke-less text.
+    # Default strokeWidth of Fabric. It pads the box of a text that has no
+    # stroke.
     stroke_width = 1
     half_sw = stroke_width / 2.0
 
@@ -1585,39 +1924,51 @@ def _text_to_fabric(
         "i-text",
         _clean(ax - half_sw, 4),
         _clean(ay - half_sw - _fabric_baseline_offset(font_px), 4),
-        _clean(box_w, 4), _clean(box_h, 4),
-        None, stroke_width, _clean(rv_alpha(color), 6),
-        author, canvas_width, canvas_height,
+        _clean(box_w, 4),
+        _clean(box_h, 4),
+        None,
+        stroke_width,
+        _clean(rv_alpha(color), 6),
+        author,
+        space.canvas_width,
+        space.canvas_height,
         props.get("uuid"),
     )
-    obj.update({
-        "text": text,
-        "fill": rv_color_to_hex(color),
-        "styles": [],
-        "fontSize": font_px,
-        "fontFamily": KITSU_TEXT_FONT_FAMILY,
-        "fontWeight": "bold" if str(props.get("fontWeight", "")).lower() == "bold" else "normal",
-        "fontStyle": "italic" if str(props.get("fontStyle", "")).lower() == "italic" else "normal",
-        "underline": str(props.get("textDecoration", "")).lower() == "underline",
-        "overline": False,
-        "linethrough": False,
-        "textAlign": "left",
-        "lineHeight": KITSU_TEXT_LINE_HEIGHT,
-        "charSpacing": 0,
-        "direction": "ltr",
-        "pathSide": "left",
-        "pathAlign": "baseline",
-        "pathStartOffset": 0,
-        "textBackgroundColor": "",
-        "textDecorationThickness": 66.667,
-        "backgroundColor": KITSU_TEXT_BACKGROUND,
-        "erasable": False,
-        "strokeLineCap": "butt",
-        "strokeLineJoin": "miter",
-        "strokeMiterLimit": 4,
-        "createdAt": _iso_ms(clock_ms[0]),
-    })
-    clock_ms[0] += 1
+    obj.update(
+        {
+            "text": text,
+            "fill": rv_color_to_hex(color),
+            "styles": [],
+            "fontSize": font_px,
+            "fontFamily": KITSU_TEXT_FONT_FAMILY,
+            "fontWeight": (
+                "bold"
+                if str(props.get("fontWeight", "")).lower() == "bold"
+                else "normal"
+            ),
+            "fontStyle": (
+                "italic"
+                if str(props.get("fontStyle", "")).lower() == "italic"
+                else "normal"
+            ),
+            "underline": str(props.get("textDecoration", "")).lower()
+            == "underline",
+            "overline": False,
+            "linethrough": False,
+            "textAlign": "left",
+            "lineHeight": KITSU_TEXT_LINE_HEIGHT,
+            "charSpacing": 0,
+            "direction": "ltr",
+            "pathSide": "left",
+            "pathAlign": "baseline",
+            "pathStartOffset": 0,
+            "textBackgroundColor": "",
+            "textDecorationThickness": 66.667,
+            "backgroundColor": KITSU_TEXT_BACKGROUND,
+            "erasable": False,
+            **_kitsu_shape_style(clock_ms),
+        }
+    )
     return obj
 
 
@@ -1626,11 +1977,14 @@ def _infer_canvas_size(
     fallback_width: float,
     fallback_height: float,
 ) -> Tuple[float, float]:
-    """Best-effort recovery of the Fabric.js canvas size Kitsu is actually
-    using for a preview's annotations, read off any existing object rather
-    than assumed to match the raw video resolution (they can differ).
-    Falls back to (fallback_width, fallback_height) only if no existing
-    object carries the field, e.g. a preview with no annotations yet."""
+    """
+    Recover, on a best-effort basis, the Fabric.js canvas size that Kitsu uses
+    for the annotations of a preview. The function reads it from any object
+    that already exists. It does not assume that the size is the same as the
+    raw video resolution (they can differ). It returns (fallback_width,
+    fallback_height) only if no object has the field, for example a preview
+    with no annotations yet.
+    """
     for record in kitsu_records or []:
         for obj in record.get("drawing", {}).get("objects", []):
             cw, ch = obj.get("canvasWidth"), obj.get("canvasHeight")
@@ -1639,8 +1993,15 @@ def _infer_canvas_size(
     return float(fallback_width), float(fallback_height)
 
 
+# ---------------------------------------------------------------------------
+# Match converted objects to Kitsu objects
+# ---------------------------------------------------------------------------
+
+
 def _rendered_stroke(obj: Dict[str, Any]) -> List[Tuple[float, float, float]]:
-    """(x, y, rendered width) per point of a PSStroke."""
+    """
+    Return (x, y, rendered width) for each point of a PSStroke.
+    """
     sw = float(obj.get("strokeWidth") or 0)
     return [
         (float(p["x"]), float(p["y"]), float(p.get("pressure", 1)) * sw)
@@ -1662,7 +2023,9 @@ def _same_stroke(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
 
 
 def _color_key(value: Any) -> Any:
-    """Comparable form of a Fabric color; None for "no color"."""
+    """
+    Return a comparable form of a Fabric color. Return None for "no color".
+    """
     if not _has_color(value):
         return None
     if isinstance(value, str):
@@ -1670,9 +2033,14 @@ def _color_key(value: Any) -> Any:
     return tuple(int(round(c)) for c in value[:4])
 
 
-def _same_box(a: Dict[str, Any], b: Dict[str, Any], types: Sequence[str]) -> bool:
-    """Same ellipse/rect: same outline and fill color, and the same box
-    once Fabric's scale/stroke/origin conventions are resolved."""
+def _same_box(
+    a: Dict[str, Any], b: Dict[str, Any], types: Sequence[str]
+) -> bool:
+    """
+    Return True for the same ellipse or rect: same outline and fill color, and
+    same box after the scale, stroke and origin conventions of Fabric are
+    resolved.
+    """
     if b.get("type") not in types:
         return False
     if _color_key(a.get("stroke")) != _color_key(b.get("stroke")):
@@ -1695,13 +2063,16 @@ def _same_rect(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
 
 
 def _same_arrow(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
-    """Same arrow: same color, and the same tail, head and line width once
-    Fabric's box/scale/rotation are resolved."""
+    """
+    Return True for the same arrow: same color, and same tail, head and line
+    width after the box, scale and rotation of Fabric are resolved.
+    """
     if b.get("type") != "arrow":
         return False
     if _color_key(a.get("stroke")) != _color_key(b.get("stroke")):
         return False
-    (ta, ha, wa), (tb, hb, wb) = _fabric_line_endpoints(a), _fabric_line_endpoints(b)
+    ta, ha, wa = _fabric_line_endpoints(a)
+    tb, hb, wb = _fabric_line_endpoints(b)
     tol = MATCH_TOLERANCE_PX
     return abs(wa - wb) <= tol and all(
         abs(va - vb) <= tol for va, vb in zip((*ta, *ha), (*tb, *hb))
@@ -1709,8 +2080,11 @@ def _same_arrow(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
 
 
 def _same_text(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
-    """Same text: same content and color, and the same baseline anchor and
-    rendered font size once Fabric's box/scale/rotation are resolved."""
+    """
+    Return True for the same text: same content and color, and same baseline
+    anchor and rendered font size after the box, scale and rotation of Fabric
+    are resolved.
+    """
     if b.get("type") not in KITSU_TEXT_TYPES:
         return False
     if _clean_text(a.get("text")) != _clean_text(b.get("text")):
@@ -1737,7 +2111,9 @@ _MATCHERS = {
 def _reference_index(
     kitsu_records: Optional[Sequence[Dict[str, Any]]],
 ) -> Dict[Optional[int], List[Dict[str, Any]]]:
-    """Existing Kitsu objects that can be matched back, grouped by frame."""
+    """
+    Return the Kitsu objects that the code can match back, grouped by frame.
+    """
     index: Dict[Optional[int], List[Dict[str, Any]]] = {}
     for record in kitsu_records or []:
         frame = record.get("frame")
@@ -1749,13 +2125,16 @@ def _reference_index(
 
 
 def _match_reference(
-    obj: Dict[str, Any], frame_num: int,
+    obj: Dict[str, Any],
+    frame_num: int,
     index: Dict[Optional[int], List[Dict[str, Any]]],
 ) -> Optional[Dict[str, Any]]:
-    """Find (and consume) the existing Kitsu object this converted one is an
-    unchanged round trip of. RV can't carry Kitsu's author, timestamps, or
-    Kitsu-specific fields (the strokeWidth/pressure split, a circle's
-    radius vs. scale), so without this every sync would rewrite them."""
+    """
+    Find (and consume) the Kitsu object of which this converted object is an
+    unchanged round trip. RV cannot carry the author, the timestamps or the
+    Kitsu-only fields of Kitsu (the strokeWidth/pressure split, the radius of a
+    circle against its scale). So without this match, each sync rewrites them.
+    """
     same = _MATCHERS.get(obj.get("type"))
     if same is None:
         return None
@@ -1767,10 +2146,9 @@ def _match_reference(
     return None
 
 
-def _iso_ms(epoch_ms: int) -> str:
-    dt = _dt.datetime.fromtimestamp(epoch_ms / 1000.0, tz=_dt.timezone.utc)
-    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
-
+# ---------------------------------------------------------------------------
+# OpenRV -> Kitsu: entry point
+# ---------------------------------------------------------------------------
 
 _SHAPE_CONVERTERS = {
     "pen": _pen_to_fabric,
@@ -1780,6 +2158,64 @@ _SHAPE_CONVERTERS = {
     "arrow": _arrow_to_fabric,
     "text": _text_to_fabric,
 }
+
+
+def _convert_frame_shapes(
+    shapes: Sequence[Dict[str, Any]],
+    space: _PaintSpace,
+    author: str,
+    clock_ms: List[int],
+) -> List[Dict[str, Any]]:
+    """
+    Convert the RV shapes of one frame to [{"obj": converted object, "erasers":
+    the RV eraser strokes that cut it}, ...], in drawing order.
+    """
+    entries: List[Dict[str, Any]] = []
+    for shape in shapes:
+        if _is_rv_eraser(shape):
+            stroke = _rv_eraser_stroke(shape, space)
+            if stroke is None:
+                continue
+            # As the eraser brush of Fabric does: the stroke goes on every
+            # erasable object that is drawn before it and that it touches.
+            for entry in entries:
+                obj = entry["obj"]
+                if _is_erasable(obj) and _boxes_overlap(
+                    _fabric_aabb(obj), stroke["bbox"]
+                ):
+                    entry["erasers"].append(stroke)
+            continue
+
+        shape_type = shape.get("type")
+        converter = _SHAPE_CONVERTERS.get(shape_type)
+        if converter is None:
+            _warn(
+                f"skipping unsupported OpenRV shape type "
+                f"'{shape_type}' (name={shape.get('name')!r})"
+            )
+            continue
+        obj = converter(shape, space, author, clock_ms)
+        if obj is not None:
+            entries.append({"obj": obj, "erasers": []})
+    return entries
+
+
+def _resolve_frame_objects(
+    entries: Sequence[Dict[str, Any]],
+    frame_num: int,
+    ref_index: Dict[Optional[int], List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """
+    Return the Kitsu objects to send for the converted entries of a frame.
+    """
+    objects: List[Dict[str, Any]] = []
+    for entry in entries:
+        obj = entry["obj"]
+        ref = _match_reference(obj, frame_num, ref_index)
+        if ref is None and "createdAt" not in obj:
+            obj["createdAt"] = _iso_ms(obj["endTime"])
+        objects.append(_resolve_eraser(obj, ref, entry["erasers"]))
+    return objects
 
 
 def convertToKitsu(
@@ -1795,38 +2231,47 @@ def convertToKitsu(
     skip_soft_deleted: bool = True,
     reference_records: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
-    """OpenRV paint shapes -> Kitsu annotation records.
+    """
+    Convert OpenRV paint shapes to Kitsu annotation records.
 
     `openrv_shapes` is a flat list of {"frame", "type", "properties", ...}
     dicts, as gathered from RVPaint nodes. Supported types: "pen" (->
-    PSStroke), "line", "ellipse" (-> Kitsu's "circle"), "rect", "arrow"
-    and "text" (-> "i-text"; empty texts are skipped).
+    PSStroke), "line", "ellipse" (-> "circle" of Kitsu), "rect", "arrow" and
+    "text" (-> "i-text"). The function skips empty texts.
 
-    `fps` is the production's frame rate; each record's "time" is derived
-    from its frame number with it, in seconds (see `frame_to_time`).
+    `fps` is the frame rate of the production. The function uses it to compute
+    the "time" of each record, in seconds, from its frame number (see
+    `frame_to_time`).
 
-    Canvas size: an explicit `canvas_width`/`canvas_height` wins. Otherwise
-    it is read off any object in `reference_records` (the preview's existing
-    Kitsu annotations), falling back to the media `width`/`height`.
+    Canvas size: an explicit `canvas_width`/`canvas_height` wins. Otherwise the
+    function reads the size from any object in `reference_records` (the
+    annotations that the preview already has in Kitsu). If there is none, it
+    uses the media `width`/`height`.
 
-    Pass the preview's existing annotations as `reference_records` when
-    syncing back: any stroke, ellipse, rect, arrow or text that comes back
-    from RV unchanged is returned as the original Kitsu object (same id, author, timestamps
-    and Kitsu-only fields) instead of a re-created copy.
+    Pass the annotations that the preview already has as `reference_records`
+    when you sync back. A stroke, ellipse, rect, arrow or text can come back
+    unchanged from RV. The function then returns the original Kitsu object
+    (same id, author, timestamps and Kitsu-only fields). It does not return a
+    re-created copy.
 
-    Erase-mode pens (mode 1) aren't objects in Kitsu: each becomes an
-    eraser path on every earlier erasable object of its frame that it
-    touches. An unchanged eraser is kept as Kitsu stored it.
+    Erase-mode pens (mode 1) are not objects in Kitsu. Each one becomes an
+    eraser path on every earlier erasable object of its frame that it touches.
+    An unchanged eraser stays as Kitsu stored it.
     """
     fps = _check_fps(fps)
     author = author or str(uuid.uuid4())
-    inferred_w, inferred_h = _infer_canvas_size(reference_records, width, height)
-    canvas_width = canvas_width or inferred_w
-    canvas_height = canvas_height or inferred_h
+    inferred_w, inferred_h = _infer_canvas_size(
+        reference_records, width, height
+    )
+    space = _PaintSpace(
+        width, height, canvas_width or inferred_w, canvas_height or inferred_h
+    )
 
     by_frame: Dict[int, List[Dict[str, Any]]] = {}
     for shape in openrv_shapes:
-        if skip_soft_deleted and shape.get("properties", {}).get("softDeleted"):
+        if skip_soft_deleted and shape.get("properties", {}).get(
+            "softDeleted"
+        ):
             continue
         frame_num = shape["frame"] + frame_offset
         by_frame.setdefault(frame_num, []).append(shape)
@@ -1836,53 +2281,18 @@ def convertToKitsu(
     records: List[Dict[str, Any]] = []
 
     for frame_num in sorted(by_frame):
-        # Each converted object with the RV eraser strokes that cut it.
-        entries: List[Dict[str, Any]] = []
-        for shape in by_frame[frame_num]:
-            if _is_rv_eraser(shape):
-                stroke = _rv_eraser_stroke(shape, width, height, canvas_width, canvas_height)
-                if stroke is None:
-                    continue
-                # Like Fabric's eraser brush: the stroke goes on every
-                # erasable object drawn before it that it touches.
-                for entry in entries:
-                    obj = entry["obj"]
-                    if _is_erasable(obj) and _boxes_overlap(_fabric_aabb(obj), stroke["bbox"]):
-                        entry["erasers"].append(stroke)
-                continue
-
-            shape_type = shape.get("type")
-            converter = _SHAPE_CONVERTERS.get(shape_type)
-            if converter is None:
-                print(
-                    f"warning: skipping unsupported OpenRV shape type "
-                    f"'{shape_type}' (name={shape.get('name')!r})",
-                    file=sys.stderr,
-                )
-                continue
-            obj = converter(
-                shape, width, height, canvas_width, canvas_height,
-                author, clock_ms,
+        entries = _convert_frame_shapes(
+            by_frame[frame_num], space, author, clock_ms
+        )
+        objects = _resolve_frame_objects(entries, frame_num, ref_index)
+        if objects:
+            records.append(
+                {
+                    "time": frame_to_time(frame_num, fps, frame_base),
+                    "frame": frame_num,
+                    "drawing": {"objects": objects},
+                }
             )
-            if obj is not None:
-                entries.append({"obj": obj, "erasers": []})
-
-        objects: List[Dict[str, Any]] = []
-        for entry in entries:
-            obj = entry["obj"]
-            ref = _match_reference(obj, frame_num, ref_index)
-            if ref is None and "createdAt" not in obj:
-                obj["createdAt"] = _iso_ms(obj["endTime"])
-            objects.append(_resolve_eraser(obj, ref, entry["erasers"]))
-
-        if not objects:
-            continue
-
-        records.append({
-            "time": frame_to_time(frame_num, fps, frame_base),
-            "frame": frame_num,
-            "drawing": {"objects": objects},
-        })
 
     return records
 
@@ -1891,23 +2301,27 @@ def convertToKitsu(
 # Kitsu -> OpenRV
 # ---------------------------------------------------------------------------
 
+
 def _pen_from_fabric(
-    obj: Dict[str, Any], width: int, height: int,
-    canvas_width: float, canvas_height: float, frame_num: int,
+    obj: Dict[str, Any],
+    space: _PaintSpace,
+    frame_num: int,
 ) -> Dict[str, Any]:
     stroke_points = obj.get("strokePoints", [])
     points_norm = [
-        pixel_to_rv_normalized(p["x"], p["y"], width, height, canvas_width, canvas_height)
-        for p in stroke_points
+        pixel_to_rv_normalized(p["x"], p["y"], space) for p in stroke_points
     ]
 
-    # psbrush draws each segment at pressure * strokeWidth; RV pens take a
-    # width per point, so bake the pressure into it (the same thing RV's own
-    # annotate mode does with tablet pressure). Kitsu's mouse fallback
-    # pressure is 0.5 when a point has none.
-    stroke_width_px = float(obj.get("strokeWidth", 0.01 * canvas_height))
+    # psbrush draws each segment at pressure * strokeWidth. RV pens take a
+    # width for each point. So apply the pressure to the width (RV annotate
+    # mode does the same with tablet pressure). The mouse fallback pressure of
+    # Kitsu is 0.5 when a point has none.
+    stroke_width_px = float(obj.get("strokeWidth", 0.01 * space.canvas_height))
     widths_norm = [
-        px_width_to_rv(stroke_width_px * float(p.get("pressure", 0.5)), canvas_height)
+        px_width_to_rv(
+            stroke_width_px * float(p.get("pressure", 0.5)),
+            space.canvas_height,
+        )
         for p in stroke_points
     ]
 
@@ -1918,23 +2332,27 @@ def _pen_from_fabric(
             "uuid": obj.get("id"),
             "points": points_norm,
             "width": widths_norm,
-            "color": color_to_rv_color(obj.get("stroke"), obj.get("opacity", 1.0)),
+            "color": color_to_rv_color(
+                obj.get("stroke"), obj.get("opacity", 1.0)
+            ),
         },
     }
 
 
 def _line_from_fabric(
-    obj: Dict[str, Any], width: int, height: int,
-    canvas_width: float, canvas_height: float, frame_num: int,
+    obj: Dict[str, Any],
+    space: _PaintSpace,
+    frame_num: int,
 ) -> Dict[str, Any]:
     x1, y1 = obj.get("x1", obj["left"]), obj.get("y1", obj["top"])
-    x2, y2 = obj.get("x2", obj["left"] + obj["width"]), obj.get("y2", obj["top"] + obj["height"])
+    x2 = obj.get("x2", obj["left"] + obj["width"])
+    y2 = obj.get("y2", obj["top"] + obj["height"])
 
-    start = pixel_to_rv_normalized(x1, y1, width, height, canvas_width, canvas_height)
-    end = pixel_to_rv_normalized(x2, y2, width, height, canvas_width, canvas_height)
+    start = pixel_to_rv_normalized(x1, y1, space)
+    end = pixel_to_rv_normalized(x2, y2, space)
 
-    stroke_width_px = obj.get("strokeWidth", 0.01 * canvas_height)
-    border_width_norm = stroke_width_px / canvas_height
+    stroke_width_px = obj.get("strokeWidth", 0.01 * space.canvas_height)
+    border_width_norm = stroke_width_px / space.canvas_height
 
     return {
         "type": "line",
@@ -1944,34 +2362,43 @@ def _line_from_fabric(
             "startPos": [start],
             "endPos": [end],
             "borderWidth": border_width_norm,
-            "borderColor": color_to_rv_color(obj.get("stroke"), obj.get("opacity", 1.0)),
+            "borderColor": color_to_rv_color(
+                obj.get("stroke"), obj.get("opacity", 1.0)
+            ),
         },
     }
 
 
 def _box_from_fabric(
-    kind: str, obj: Dict[str, Any], width: int, height: int,
-    canvas_width: float, canvas_height: float, frame_num: int,
+    kind: str,
+    obj: Dict[str, Any],
+    space: _PaintSpace,
+    frame_num: int,
 ) -> Dict[str, Any]:
-    """A Fabric box-shaped object -> an RV "ellipse" or "rect" (`kind`),
-    which share one property set. RV's are axis-aligned, so any rotation
-    is dropped (about the centre)."""
+    """
+    Convert a Fabric box-shaped object to an RV "ellipse" or "rect" (`kind`).
+    They share one property set. RV shapes are axis-aligned, so the function
+    drops any rotation (about the centre).
+    """
     cx, cy, rx, ry, stroke_width_px = _fabric_box_geometry(obj)
     if float(obj.get("angle") or 0) % 360:
-        print(
-            f"warning: {kind} {obj.get('id')!r} is rotated {obj.get('angle')} deg; "
-            f"OpenRV {kind}s can't rotate, dropping the rotation",
-            file=sys.stderr,
+        _warn(
+            f"{kind} {obj.get('id')!r} is rotated {obj.get('angle')} deg; "
+            f"OpenRV {kind}s can't rotate, dropping the rotation"
         )
 
-    # Canvas y runs down and RV y runs up, so the canvas bottom-left corner
-    # is RV's min and the top-right is RV's max.
-    min_pt = pixel_to_rv_normalized(cx - rx, cy + ry, width, height, canvas_width, canvas_height)
-    max_pt = pixel_to_rv_normalized(cx + rx, cy - ry, width, height, canvas_width, canvas_height)
+    # Canvas y goes down and RV y goes up. So the bottom-left corner of the
+    # canvas is the min of RV, and the top-right corner is the max of RV.
+    min_pt = pixel_to_rv_normalized(cx - rx, cy + ry, space)
+    max_pt = pixel_to_rv_normalized(cx + rx, cy - ry, space)
 
     opacity = obj.get("opacity", 1.0)
     fill = obj.get("fill")
-    inner_color = color_to_rv_color(fill, opacity) if _has_color(fill) else list(_RV_NO_COLOR)
+    inner_color = (
+        color_to_rv_color(fill, opacity)
+        if _has_color(fill)
+        else list(_RV_NO_COLOR)
+    )
 
     return {
         "type": kind,
@@ -1980,11 +2407,13 @@ def _box_from_fabric(
             "uuid": obj.get("id"),
             "min": [min_pt],
             "max": [max_pt],
-            "borderWidth": px_width_to_rv(stroke_width_px, canvas_height),
+            "borderWidth": px_width_to_rv(
+                stroke_width_px, space.canvas_height
+            ),
             "borderColor": color_to_rv_color(obj.get("stroke"), opacity),
             "innerColor": inner_color,
-            # The rest of the property set RV's own ellipses and rects
-            # carry: shown on its frame only, in both eyes, not deleted.
+            # The other properties that RV ellipses and rects have: shown on
+            # its frame only, in both eyes, not deleted.
             "startFrame": frame_num,
             "duration": 1,
             "eye": 2,
@@ -1994,44 +2423,51 @@ def _box_from_fabric(
 
 
 def _ellipse_from_fabric(
-    obj: Dict[str, Any], width: int, height: int,
-    canvas_width: float, canvas_height: float, frame_num: int,
+    obj: Dict[str, Any],
+    space: _PaintSpace,
+    frame_num: int,
 ) -> Dict[str, Any]:
-    """Kitsu "circle" (or Fabric "ellipse") -> RV "ellipse"."""
-    return _box_from_fabric("ellipse", obj, width, height,
-                            canvas_width, canvas_height, frame_num)
+    """
+    Convert a Kitsu "circle" (or Fabric "ellipse") to an RV "ellipse".
+    """
+    return _box_from_fabric("ellipse", obj, space, frame_num)
 
 
 def _rect_from_fabric(
-    obj: Dict[str, Any], width: int, height: int,
-    canvas_width: float, canvas_height: float, frame_num: int,
+    obj: Dict[str, Any],
+    space: _PaintSpace,
+    frame_num: int,
 ) -> Dict[str, Any]:
-    """Kitsu "rect" -> RV "rect". RV rects have square corners, so any
-    corner rounding (rx/ry) is dropped."""
+    """
+    Convert a Kitsu "rect" to an RV "rect". RV rects have square corners, so
+    the function drops any corner rounding (rx/ry).
+    """
     if float(obj.get("rx") or 0) or float(obj.get("ry") or 0):
-        print(
-            f"warning: rect {obj.get('id')!r} has rounded corners "
+        _warn(
+            f"rect {obj.get('id')!r} has rounded corners "
             f"(rx={obj.get('rx')}, ry={obj.get('ry')}); OpenRV rects are "
-            f"square-cornered, dropping the rounding",
-            file=sys.stderr,
+            f"square-cornered, dropping the rounding"
         )
-    return _box_from_fabric("rect", obj, width, height,
-                            canvas_width, canvas_height, frame_num)
+    return _box_from_fabric("rect", obj, space, frame_num)
 
 
 def _arrow_from_fabric(
-    obj: Dict[str, Any], width: int, height: int,
-    canvas_width: float, canvas_height: float, frame_num: int,
+    obj: Dict[str, Any],
+    space: _PaintSpace,
+    frame_num: int,
 ) -> Dict[str, Any]:
-    """Kitsu "arrow" -> RV "arrow", tail at startPos and head at endPos.
-    RV sizes the head from the line thickness, so Kitsu's
-    arrowHeadSize/arrowHeadWidth have nowhere to go and are dropped."""
+    """
+    Convert a Kitsu "arrow" to an RV "arrow", with the tail at startPos and the
+    head at endPos. RV sizes the head from the line thickness. So arrowHeadSize
+    and arrowHeadWidth of Kitsu have nowhere to go, and the function drops
+    them.
+    """
     (tx, ty), (hx, hy), stroke_width_px = _fabric_line_endpoints(obj)
-    start = pixel_to_rv_normalized(tx, ty, width, height, canvas_width, canvas_height)
-    end = pixel_to_rv_normalized(hx, hy, width, height, canvas_width, canvas_height)
+    start = pixel_to_rv_normalized(tx, ty, space)
+    end = pixel_to_rv_normalized(hx, hy, space)
 
-    width_rv = px_width_to_rv(stroke_width_px, canvas_height)
-    # RV's own arrows carry the line color in both borderColor and innerColor.
+    width_rv = px_width_to_rv(stroke_width_px, space.canvas_height)
+    # RV arrows carry the line color in both borderColor and innerColor.
     color = color_to_rv_color(obj.get("stroke"), obj.get("opacity", 1.0))
 
     return {
@@ -2054,30 +2490,31 @@ def _arrow_from_fabric(
 
 
 def _text_from_fabric(
-    obj: Dict[str, Any], width: int, height: int,
-    canvas_width: float, canvas_height: float, frame_num: int,
+    obj: Dict[str, Any],
+    space: _PaintSpace,
+    frame_num: int,
 ) -> Dict[str, Any]:
-    """Kitsu "i-text" -> RV "text", with the property set RV's annotate
-    mode writes. RV anchors text at the left end of its first baseline and
-    sizes it as a fraction of the image height. RV draws text unrotated,
-    left-aligned and without a background, in its own default font."""
+    """
+    Convert a Kitsu "i-text" to an RV "text", with the property set that RV
+    annotate mode writes. RV anchors text at the left end of its first baseline
+    and sizes it as a fraction of the image height. RV draws text unrotated,
+    left-aligned and without a background, in its default font.
+    """
     ax, ay, font_px = _fabric_text_anchor(obj)
-    position = pixel_to_rv_normalized(ax, ay, width, height, canvas_width, canvas_height)
-    font_size = px_width_to_rv(font_px, canvas_height)
+    position = pixel_to_rv_normalized(ax, ay, space)
+    font_size = px_width_to_rv(font_px, space.canvas_height)
     text = _clean_text(obj.get("text"))
 
     if float(obj.get("angle") or 0) % 360:
-        print(
-            f"warning: text {obj.get('id')!r} is rotated {obj.get('angle')} deg; "
-            f"OpenRV draws text unrotated, dropping the rotation",
-            file=sys.stderr,
+        _warn(
+            f"text {obj.get('id')!r} is rotated {obj.get('angle')} deg; "
+            f"OpenRV draws text unrotated, dropping the rotation"
         )
     align = str(obj.get("textAlign") or "left").lower()
     if "\n" in text and align not in ("left", "justify", "justify-left"):
-        print(
-            f"warning: text {obj.get('id')!r} is {align}-aligned; OpenRV draws "
-            f"multi-line text left-aligned",
-            file=sys.stderr,
+        _warn(
+            f"text {obj.get('id')!r} is {align}-aligned; OpenRV draws "
+            f"multi-line text left-aligned"
         )
 
     weight = obj.get("fontWeight")
@@ -2093,8 +2530,11 @@ def _text_from_fabric(
         "properties": {
             "uuid": obj.get("id"),
             "position": list(position),
-            # Fabric text is colored by its fill; its stroke is an outline.
-            "color": color_to_rv_color(obj.get("fill"), obj.get("opacity", 1.0)),
+            # Fabric text gets its color from its fill. Its stroke is an
+            # outline.
+            "color": color_to_rv_color(
+                obj.get("fill"), obj.get("opacity", 1.0)
+            ),
             "text": text,
             "fontSize": font_size,
             "size": font_size / RV_LEGACY_TEXT_SIZE_FACTOR,
@@ -2105,7 +2545,7 @@ def _text_from_fabric(
             "origin": "",
             "debug": 0,
             "mode": 0,
-            # "" is RV's default annotation font.
+            # "" is the default annotation font of RV.
             "fontFamily": "",
             "fontWeight": "bold" if bold else "normal",
             "fontStyle": "italic" if italic else "normal",
@@ -2140,22 +2580,26 @@ def convertToORV(
     fps: Optional[float] = None,
     frame_base: int = 1,
 ) -> List[Dict[str, Any]]:
-    """Kitsu annotation records -> flat list of OpenRV paint shapes
-    ({"type", "frame", "properties"}). Supported Kitsu types: "PSStroke"
-    (-> pen), "line", "circle"/"ellipse" (-> ellipse), "rect", "arrow" and
+    """
+    Convert Kitsu annotation records to a flat list of OpenRV paint shapes
+    ({"type", "frame", "properties"}). Supported Kitsu types: "PSStroke" (->
+    pen), "line", "circle"/"ellipse" (-> ellipse), "rect", "arrow" and
     "i-text"/"text"/"textbox" (-> text).
 
-    Each object's own canvasWidth/canvasHeight is used when present;
-    otherwise `canvas_width`/`canvas_height`, then the media size.
+    The function uses the own canvasWidth/canvasHeight of each object when
+    present. Otherwise it uses `canvas_width`/`canvas_height`, then the media
+    size.
 
-    A record's "frame" is used when present. Without one, its "time" is
-    converted to a frame at the production `fps` (the inverse of
-    `convertToKitsu`, counting from `frame_base`). Records with neither,
-    or when no `fps` is given, land on `default_frame` (still previews).
+    The function uses the "frame" of a record when present. Without it, the
+    function converts the "time" to a frame at the production `fps` (the
+    inverse of `convertToKitsu`, counting from `frame_base`). A record with
+    neither goes on `default_frame`. A record with only a "time" goes there
+    too when no `fps` is given (still previews).
 
-    Kitsu erasers (the "eraser" group on each erased object) become RV
-    pens in erase mode (properties["mode"] == 1), one per eraser stroke,
-    placed after the objects it erased and before the ones it didn't.
+    Kitsu erasers (the "eraser" group on each erased object) become RV pens in
+    erase mode (properties["mode"] == 1), one for each eraser stroke. The
+    function places them after the objects that they erased and before the
+    others.
     """
     default_canvas_width = canvas_width or float(width)
     default_canvas_height = canvas_height or float(height)
@@ -2175,82 +2619,123 @@ def convertToORV(
             frame_num = default_frame
         frame_num -= frame_offset
         objects = record.get("drawing", {}).get("objects", [])
-        shapes.extend(_record_to_orv(
-            objects, width, height, default_canvas_width, default_canvas_height, frame_num,
-        ))
+        shapes.extend(
+            _record_to_orv(
+                objects,
+                width,
+                height,
+                default_canvas_width,
+                default_canvas_height,
+                frame_num,
+            )
+        )
 
     return shapes
 
 
+def _collect_erasers(
+    obj: Dict[str, Any],
+    index: int,
+    erasers: List[Dict[str, Any]],
+    space: _PaintSpace,
+) -> None:
+    """
+    Add the eraser strokes of `obj` to `erasers`, in RV units. Fabric stores a
+    copy of a stroke on every object that it cut. So a stroke that is already
+    in `erasers` only records that it also cut this object.
+    """
+    tol = MATCH_TOLERANCE_PX / space.canvas_height
+    for e_i, entry in enumerate(_fabric_eraser_entries(obj)):
+        for s_i, stroke in enumerate(entry["strokes"]):
+            points = [
+                pixel_to_rv_normalized(x, y, space)
+                for x, y in stroke["points"]
+            ]
+            norm = {
+                "points": points,
+                "width": px_width_to_rv(stroke["width"], space.canvas_height),
+            }
+            same = next(
+                (e for e in erasers if _same_eraser_stroke(e, norm, tol)),
+                None,
+            )
+            if same is not None:
+                same["attached"].add(index)
+                continue
+            erasers.append(
+                {
+                    **norm,
+                    "attached": {index},
+                    "bbox": _points_bbox(points, norm["width"] / 2.0),
+                    "seed": f"{obj.get('id')}:{e_i}:{s_i}",
+                }
+            )
+
+
 def _record_to_orv(
-    objects: Sequence[Dict[str, Any]], width: int, height: int,
-    default_canvas_width: float, default_canvas_height: float, frame_num: int,
+    objects: Sequence[Dict[str, Any]],
+    width: int,
+    height: int,
+    default_canvas_width: float,
+    default_canvas_height: float,
+    frame_num: int,
 ) -> List[Dict[str, Any]]:
-    """One Kitsu record's objects -> RV shapes, with an eraser pen for each
-    distinct eraser stroke (Fabric stores a copy on every object it cut)."""
+    """
+    Convert the objects of one Kitsu record to RV shapes.
+
+    Add an eraser pen for each distinct eraser stroke. Fabric stores a copy of
+    the stroke on every object that it cut.
+    """
     items: List[Dict[str, Any]] = []
     erasers: List[Dict[str, Any]] = []
 
     for index, obj in enumerate(objects):
         obj_type = obj.get("type")
-        obj_canvas_width = float(obj.get("canvasWidth") or default_canvas_width)
-        obj_canvas_height = float(obj.get("canvasHeight") or default_canvas_height)
+        space = _PaintSpace(
+            width,
+            height,
+            float(obj.get("canvasWidth") or default_canvas_width),
+            float(obj.get("canvasHeight") or default_canvas_height),
+        )
 
         converter = _TYPE_CONVERTERS.get(obj_type)
         shape = None
         if converter is None:
-            print(
-                f"warning: skipping unsupported Kitsu object type "
-                f"'{obj_type}' (id={obj.get('id')!r})",
-                file=sys.stderr,
+            _warn(
+                f"skipping unsupported Kitsu object type "
+                f"'{obj_type}' (id={obj.get('id')!r})"
             )
         else:
             shape = converter(
-                obj, width, height, obj_canvas_width, obj_canvas_height, frame_num,
+                obj,
+                space,
+                frame_num,
             )
         if shape is not None:
-            items.append({
-                "index": index,
-                "shape": shape,
-                "bbox": _norm_box(_fabric_aabb(obj), width, height,
-                                  obj_canvas_width, obj_canvas_height),
-            })
+            items.append(
+                {
+                    "index": index,
+                    "shape": shape,
+                    "bbox": _norm_box(
+                        _fabric_aabb(obj),
+                        space,
+                    ),
+                }
+            )
 
-        tol = MATCH_TOLERANCE_PX / obj_canvas_height
-        for e_i, entry in enumerate(_fabric_eraser_entries(obj)):
-            for s_i, stroke in enumerate(entry["strokes"]):
-                points = [
-                    pixel_to_rv_normalized(x, y, width, height,
-                                           obj_canvas_width, obj_canvas_height)
-                    for x, y in stroke["points"]
-                ]
-                norm = {"points": points,
-                        "width": px_width_to_rv(stroke["width"], obj_canvas_height)}
-                same = next((e for e in erasers if _same_eraser_stroke(e, norm, tol)), None)
-                if same is not None:
-                    same["attached"].add(index)
-                    continue
-                erasers.append({
-                    **norm,
-                    "attached": {index},
-                    "bbox": _points_bbox(points, norm["width"] / 2.0),
-                    "seed": f"{obj.get('id')}:{e_i}:{s_i}",
-                })
+        _collect_erasers(
+            obj,
+            index,
+            erasers,
+            space,
+        )
 
     return _order_with_erasers(items, erasers, frame_num)
 
 
-def extract_authors(kitsu_records: Sequence[Dict[str, Any]]) -> Dict[str, str]:
-    """Map each object's Fabric "id" -> its Kitsu "createdBy" person id,
-    since OpenRV has no field to carry that through. Useful if the caller
-    wants to preserve authorship out-of-band alongside `convertToORV`'s
-    output."""
-    authors: Dict[str, str] = {}
-    for record in kitsu_records or []:
-        for obj in record.get("drawing", {}).get("objects", []):
-            if obj.get("id") and obj.get("createdBy"):
-                authors[obj["id"]] = obj["createdBy"]
-    return authors
+# ---------------------------------------------------------------------------
+# Sync: what to send to Kitsu
+# ---------------------------------------------------------------------------
 
 
 def _same_time(a: Any, b: Any) -> bool:
@@ -2264,13 +2749,15 @@ def split_annotation_changes(
     records: Sequence[Dict[str, Any]],
     reference_records: Optional[Sequence[Dict[str, Any]]],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """(additions, updates) for gazu.files.update_preview_annotations,
-    from `convertToKitsu` records and the annotations Kitsu already has.
+    """
+    Return (additions, updates) for gazu.files.update_preview_annotations, from
+    the `convertToKitsu` records and the annotations that Kitsu already has.
 
-    Kitsu never overwrites an object through an addition (one whose id is
-    already on that frame is dropped), so objects that exist but changed,
-    e.g. by being erased, have to go in updates, under the time Kitsu
-    stores them at. Unchanged objects aren't sent."""
+    Kitsu never overwrites an object through an addition (it drops an object
+    whose id is already on that frame). So objects that exist but changed (for
+    example, by an erase) must go in updates, under the time at which Kitsu
+    stores them. The function does not send unchanged objects.
+    """
     known: Dict[str, Tuple[Any, Dict[str, Any]]] = {}
     for record in reference_records or []:
         for obj in record.get("drawing", {}).get("objects", []):
@@ -2286,284 +2773,104 @@ def split_annotation_changes(
             if ref is None or not _same_time(ref[0], record["time"]):
                 added.append(obj)
             elif obj != ref[1]:
-                update = updates.setdefault(ref[0], {
-                    "time": ref[0],
-                    "frame": record.get("frame"),
-                    "drawing": {"objects": []},
-                })
+                update = updates.setdefault(
+                    ref[0],
+                    {
+                        "time": ref[0],
+                        "frame": record.get("frame"),
+                        "drawing": {"objects": []},
+                    },
+                )
                 update["drawing"]["objects"].append(obj)
         if added:
-            additions.append({
-                "time": record["time"],
-                "frame": record.get("frame"),
-                "drawing": {"objects": added},
-            })
+            additions.append(
+                {
+                    "time": record["time"],
+                    "frame": record.get("frame"),
+                    "drawing": {"objects": added},
+                }
+            )
     return additions, list(updates.values())
-
-
-# ---------------------------------------------------------------------------
-# RVPaint GTO serialization
-# ---------------------------------------------------------------------------
-
-def _fnum(n: float) -> str:
-    if n == int(n):
-        return str(int(n))
-    return f"{n:.9f}".rstrip("0").rstrip(".") or "0"
-
-
-def _flat(arr: Sequence[float]) -> str:
-    return "[ " + " ".join(_fnum(n) for n in arr) + " ]"
-
-
-def _nested(pairs: Sequence[Point]) -> str:
-    return "[ " + " ".join(f"[ {_fnum(x)} {_fnum(y)} ]" for x, y in pairs) + " ]"
-
-
-def _color01(color: Any, default: Sequence[float] = (1.0, 1.0, 1.0, 1.0)) -> List[float]:
-    """Any RV color form (flat 0..255 from `convertToORV`, or RV's own 0..1,
-    flat or as [[r, g, b, a]]) -> the flat 0..1 [r, g, b, a] GTO wants."""
-    rgba = _rv_rgba(color)
-    return [round(c, 6) for c in (rgba if rgba is not None else default)]
-
-
-def _pen_block(pen: Dict[str, Any], pen_id: int, frame: int) -> Tuple[str, str]:
-    name = f'"pen:{pen_id}:{frame}:Kitsu"'
-    color = _color01(pen["color"])
-    width = _per_point_widths(pen["width"], len(pen["points"]))
-
-    lines = [f"    {name}", "    {"]
-    lines.append(f"        float[4] color = {_flat(color)}")
-    lines.append(f"        float width = {_flat(width)}")
-    lines.append(f'        string brush = "{pen.get("brush", "circle")}"')
-    lines.append(f"        float[2] points = {_nested(pen['points'])}")
-    lines.append(f"        int debug = {int(pen.get('debug', 0))}")
-    lines.append(f"        int join = {int(pen.get('join', 3))}")
-    lines.append(f"        int cap = {int(pen.get('cap', 1))}")
-    lines.append(f"        int splat = {int(pen.get('splat', 0))}")
-    # 1 = eraser: clears what's drawn before it on the frame.
-    lines.append(f"        int mode = {int(_rv_scalar(pen.get('mode'), RV_PEN_MODE_PAINT))}")
-    if pen.get("uuid"):
-        lines.append(f'        string uuid = "{pen["uuid"]}"')
-    lines.append("    }")
-    return "\n".join(lines), name.strip('"')
-
-
-def _box_block(kind: str, ell: Dict[str, Any], ell_id: int, frame: int) -> Tuple[str, str]:
-    """An RVPaint ellipse or rect component (`kind`), with the same
-    property set RV writes for those drawn in its own annotate mode."""
-    name = f'"{kind}:{ell_id}:{frame}:Kitsu"'
-    inner = _color01(ell.get("innerColor"), default=(1.0, 1.0, 1.0, 0.0))
-    border = _color01(ell.get("borderColor"))
-
-    lines = [f"    {name}", "    {"]
-    lines.append(f"        int startFrame = {int(ell.get('startFrame', frame))}")
-    lines.append(f"        int duration = {int(ell.get('duration', 1))}")
-    lines.append(f"        int eye = {int(ell.get('eye', 2))}")
-    lines.append(f"        float[2] min = {_nested(ell['min'])}")
-    lines.append(f"        float[2] max = {_nested(ell['max'])}")
-    lines.append(f"        float[4] innerColor = {_flat(inner)}")
-    lines.append(f"        float[4] borderColor = {_flat(border)}")
-    lines.append(f"        float borderWidth = {_fnum(float(ell.get('borderWidth', 0.01)))}")
-    if ell.get("uuid"):
-        lines.append(f'        string uuid = "{ell["uuid"]}"')
-    lines.append(f"        int softDeleted = {int(ell.get('softDeleted', 0))}")
-    lines.append("    }")
-    return "\n".join(lines), name.strip('"')
-
-
-def _ellipse_block(ell: Dict[str, Any], ell_id: int, frame: int) -> Tuple[str, str]:
-    return _box_block("ellipse", ell, ell_id, frame)
-
-
-def _rect_block(rect: Dict[str, Any], rect_id: int, frame: int) -> Tuple[str, str]:
-    return _box_block("rect", rect, rect_id, frame)
-
-
-def _arrow_block(arrow: Dict[str, Any], arrow_id: int, frame: int) -> Tuple[str, str]:
-    """An RVPaint arrow component, with the property set RV writes for
-    arrows drawn in its own annotate mode."""
-    name = f'"arrow:{arrow_id}:{frame}:Kitsu"'
-    border = _color01(arrow.get("borderColor"))
-    inner = _color01(arrow.get("innerColor")) if arrow.get("innerColor") else border
-    width = _rv_arrow_width(arrow)
-
-    lines = [f"    {name}", "    {"]
-    lines.append(f"        int startFrame = {int(arrow.get('startFrame', frame))}")
-    lines.append(f"        int duration = {int(arrow.get('duration', 1))}")
-    lines.append(f"        int eye = {int(arrow.get('eye', 2))}")
-    lines.append(f"        float[2] startPos = {_nested(arrow['startPos'])}")
-    lines.append(f"        float[2] endPos = {_nested(arrow['endPos'])}")
-    lines.append(f"        float[4] borderColor = {_flat(border)}")
-    lines.append(f"        float borderWidth = {_fnum(float(arrow.get('borderWidth', width)))}")
-    lines.append(f"        float[4] innerColor = {_flat(inner)}")
-    lines.append(f"        float thickness = {_fnum(width)}")
-    if arrow.get("uuid"):
-        lines.append(f'        string uuid = "{arrow["uuid"]}"')
-    lines.append(f"        int softDeleted = {int(arrow.get('softDeleted', 0))}")
-    lines.append("    }")
-    return "\n".join(lines), name.strip('"')
-
-
-def _gto_string(value: Any) -> str:
-    escaped = (str(value).replace("\\", "\\\\").replace('"', '\\"')
-               .replace("\n", "\\n").replace("\t", "\\t"))
-    return f'"{escaped}"'
-
-
-def _text_block(txt: Dict[str, Any], text_id: int, frame: int) -> Tuple[str, str]:
-    """An RVPaint text component, with the property set RV writes for text
-    placed in its own annotate mode (legacy size/scale plus the QFont-era
-    fontSize/fontFamily/...)."""
-    name = f'"text:{text_id}:{frame}:Kitsu"'
-    font_size = _rv_text_font_size(txt)
-    scale = _rv_scalar(txt.get("scale"), 1.0) or 1.0
-    size = _rv_scalar(txt.get("size"))
-    if size is None:
-        size = font_size / scale / RV_LEGACY_TEXT_SIZE_FACTOR
-
-    lines = [f"    {name}", "    {"]
-    lines.append(f"        float[2] position = {_nested([_rv_point(txt['position'])])}")
-    lines.append(f"        float[4] color = {_flat(_color01(txt.get('color')))}")
-    lines.append(f"        float spacing = {_fnum(_rv_scalar(txt.get('spacing'), 0.8))}")
-    lines.append(f"        float size = {_fnum(size)}")
-    lines.append(f"        float scale = {_fnum(scale)}")
-    lines.append(f"        float rotation = {_fnum(_rv_scalar(txt.get('rotation'), 0.0))}")
-    lines.append(f"        string font = {_gto_string(txt.get('font', ''))}")
-    lines.append(f"        string text = {_gto_string(_clean_text(txt.get('text')))}")
-    lines.append(f"        string origin = {_gto_string(txt.get('origin', ''))}")
-    lines.append(f"        int debug = {int(txt.get('debug', 0))}")
-    lines.append(f"        int startFrame = {int(txt.get('startFrame', frame))}")
-    lines.append(f"        int duration = {int(txt.get('duration', 1))}")
-    lines.append(f"        int mode = {int(txt.get('mode', 0))}")
-    lines.append(f"        string fontFamily = {_gto_string(txt.get('fontFamily', ''))}")
-    lines.append(f"        float fontSize = {_fnum(font_size)}")
-    lines.append(f"        string fontWeight = {_gto_string(txt.get('fontWeight', 'normal'))}")
-    lines.append(f"        string fontStyle = {_gto_string(txt.get('fontStyle', 'normal'))}")
-    lines.append(f"        string textDecoration = {_gto_string(txt.get('textDecoration', 'none'))}")
-    lines.append(f"        string textAlign = {_gto_string(txt.get('textAlign', 'left'))}")
-    if txt.get("uuid"):
-        lines.append(f"        string uuid = {_gto_string(txt['uuid'])}")
-    lines.append(f"        int softDeleted = {int(txt.get('softDeleted', 0))}")
-    lines.append("    }")
-    return "\n".join(lines), name.strip('"')
-
-
-_GTO_BLOCKS = {
-    "pen": _pen_block,
-    "ellipse": _ellipse_block,
-    "rect": _rect_block,
-    "arrow": _arrow_block,
-    "text": _text_block,
-}
-
-
-def _paint_gto(paint_node_name: str, items: Sequence[Tuple[int, str, Dict[str, Any]]]) -> Optional[str]:
-    """RVPaint GTO text for (frame, kind, properties) items, drawn in the
-    given order on each frame."""
-    blocks = []
-    frame_order: Dict[int, List[str]] = {}
-    next_id = 0
-
-    for frame, kind, data in items:
-        block, cname = _GTO_BLOCKS[kind](data, next_id, frame)
-        blocks.append(block)
-        frame_order.setdefault(frame, []).append(cname)
-        next_id += 1
-
-    if not blocks:
-        return None
-
-    lines = ["GTOa (4)", ""]
-    lines.append(f"{paint_node_name} : RVPaint (3)")
-    lines.append("{")
-    lines.append("    paint")
-    lines.append("    {")
-    lines.append(f"        int nextId = {next_id}")
-    lines.append("        int nextAnnotationId = 0")
-    lines.append("        int show = 1")
-    lines.append("        string exclude = [ ]")
-    lines.append("        string include = [ ]")
-    lines.append("    }")
-    lines.extend(blocks)
-    for frame, names in sorted(frame_order.items()):
-        order_str = " ".join(f'"{n}"' for n in names)
-        lines.append(f'    "frame:{frame}"')
-        lines.append("    {")
-        lines.append(f"        string order = [ {order_str} ]")
-        lines.append("    }")
-    lines.append("}")
-    return "\n".join(lines)
-
-
-def build_paint_gto(paint_node_name: str, openrv_annotations: List[Dict[str, Any]]) -> Optional[str]:
-    """
-    openrv_annotations: list of {
-        "frame": int,
-        "pens":     [ {color, width, brush, points, join, cap, splat, debug}, ... ],
-        "ellipses": [ {min, max, borderWidth, borderColor, innerColor,
-                       startFrame, duration, eye, uuid}, ... ],
-        "rects":    [ same keys as "ellipses" ],
-        "arrows":   [ {startPos, endPos, borderWidth, thickness, borderColor,
-                       innerColor, startFrame, duration, eye, uuid}, ... ],
-        "texts":    [ {position, color, text, fontSize, fontWeight, fontStyle,
-                       textDecoration, spacing, size, scale, rotation,
-                       startFrame, duration, uuid, debug}, ... ],
-    }
-    Pen, ellipse, rect, arrow and text entries are the "properties" dicts
-    `convertToORV` emits. A text without "fontSize" is sized from its
-    legacy size * scale.
-    Colors may be 0..255 or 0..1; they are written as 0..1.
-
-    Returns the RVPaint GTO fragment as text, or None if there's nothing
-    to write on any frame.
-    """
-    items: List[Tuple[int, str, Dict[str, Any]]] = []
-    for frame_data in openrv_annotations:
-        frame = int(frame_data["frame"])
-        items += [(frame, "pen", p) for p in frame_data.get("pens", [])]
-        items += [(frame, "ellipse", e) for e in frame_data.get("ellipses", [])]
-        items += [(frame, "rect", r) for r in frame_data.get("rects", [])]
-        items += [(frame, "arrow", a) for a in frame_data.get("arrows", [])]
-        items += [(frame, "text", t) for t in frame_data.get("texts", [])]
-    return _paint_gto(paint_node_name, items)
-
-
-def shapes_to_paint_gto(paint_node_name: str, shapes: Sequence[Dict[str, Any]]) -> Optional[str]:
-    """`convertToORV` output -> RVPaint GTO text, keeping each frame's
-    drawing order. Shape types with no GTO writer (e.g. "line") are skipped
-    with a warning."""
-    items: List[Tuple[int, str, Dict[str, Any]]] = []
-    for shape in shapes:
-        kind = shape.get("type")
-        if kind not in _GTO_BLOCKS:
-            print(f"warning: no RVPaint writer for shape type {kind!r}, skipping", file=sys.stderr)
-            continue
-        items.append((int(shape["frame"]), kind, shape["properties"]))
-    return _paint_gto(paint_node_name, items)
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-def _main() -> None:
-    """Convert a Kitsu preview-annotation JSON dump into OpenRV paint
-    shapes. Works without OpenRV, PySide6, or gazu installed."""
-    import argparse
 
+def _main() -> None:
+    """
+    Convert a Kitsu preview-annotation JSON dump into OpenRV paint shapes. This
+    works without OpenRV, PySide6 or gazu installed.
+    """
     parser = argparse.ArgumentParser(
-        description="Convert Kitsu preview-annotation JSON into OpenRV paint shapes."
+        description=(
+            "Convert Kitsu preview-annotation JSON into OpenRV paint shapes."
+        )
     )
-    parser.add_argument("kitsu_json", help="Path to a JSON file containing the Kitsu annotation records list")
-    parser.add_argument("--width", type=int, required=True, help="Source video/image width in px")
-    parser.add_argument("--height", type=int, required=True, help="Source video/image height in px")
-    parser.add_argument("--canvas-width", type=float, default=None, help="Fabric.js canvas width, if different from --width")
-    parser.add_argument("--canvas-height", type=float, default=None, help="Fabric.js canvas height, if different from --height")
-    parser.add_argument("--frame-offset", type=int, default=0, help="Subtracted from each Kitsu frame number")
-    parser.add_argument("--default-frame", type=int, default=1, help="Frame to use for records with no frame field (still previews)")
-    parser.add_argument("--fps", type=float, default=None, help="Production frame rate; used to turn a record's 'time' into a frame when it has no 'frame' field")
-    parser.add_argument("--frame-base", type=int, default=1, help="Frame number that time 0 corresponds to (with --fps)")
-    parser.add_argument("-o", "--output", default=None, help="Where to write the OpenRV shapes JSON (default: stdout)")
+    parser.add_argument(
+        "kitsu_json",
+        help=(
+            "Path to a JSON file containing the Kitsu annotation records list"
+        ),
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        required=True,
+        help="Source video/image width in px",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        required=True,
+        help="Source video/image height in px",
+    )
+    parser.add_argument(
+        "--canvas-width",
+        type=float,
+        default=None,
+        help="Fabric.js canvas width, if different from --width",
+    )
+    parser.add_argument(
+        "--canvas-height",
+        type=float,
+        default=None,
+        help="Fabric.js canvas height, if different from --height",
+    )
+    parser.add_argument(
+        "--frame-offset",
+        type=int,
+        default=0,
+        help="Subtracted from each Kitsu frame number",
+    )
+    parser.add_argument(
+        "--default-frame",
+        type=int,
+        default=1,
+        help="Frame to use for records with no frame field (still previews)",
+    )
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        help=(
+            "Production frame rate; used to turn a record's 'time' into a "
+            "frame when it has no 'frame' field"
+        ),
+    )
+    parser.add_argument(
+        "--frame-base",
+        type=int,
+        default=1,
+        help="Frame number that time 0 corresponds to (with --fps)",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="Where to write the OpenRV shapes JSON (default: stdout)",
+    )
     args = parser.parse_args()
 
     with open(args.kitsu_json) as f:
