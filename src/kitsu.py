@@ -1,10 +1,12 @@
-"""UI for the Kitsu Review OpenRV plugin.
+"""
+UI for the Kitsu Review OpenRV plugin.
 
-The docked panel, its event handlers (the controller layer), and the RV
-MinorMode that hosts it. Handlers read widget state, call into
-KitsuReviewModel (kitsu_review_model.py) for all Kitsu, session and RV
-annotation work, and turn the results and errors into widget updates
-and message boxes.
+This module has the docked panel, its event handlers (the controller
+layer), and the RV MinorMode that holds the panel.
+The handlers read the widget state.
+They call KitsuReviewModel (kitsu_review_model.py) for all Kitsu, session,
+and RV annotation work.
+They show the results in the widgets and show the errors in message boxes.
 """
 
 from __future__ import annotations
@@ -78,11 +80,12 @@ def _status_qcolor(status):
 
 
 class KitsuReviewPanel(_QWidgetBase):
-    """Main widget for the Kitsu Review plugin.
+    """
+    Main widget for the Kitsu Review plugin.
 
-    Intended to be embedded as a dock widget below RV's review
-    viewport (see KitsuReviewMode), not shown as its own top-level
-    window.
+    Embed this widget as a dock widget below the RV review viewport
+    (see KitsuReviewMode).
+    Do not show it as its own top-level window.
     """
 
     THUMBNAIL_SIZE = (96, 54)
@@ -100,7 +103,7 @@ class KitsuReviewPanel(_QWidgetBase):
     )
     PLAYLIST_PENDING_COLUMN = 2
 
-    # Indices of the source tabs.
+    # Indexes of the source tabs.
     PLAYLISTS_TAB = 0
     CHECKS_TAB = 1
 
@@ -115,19 +118,19 @@ class KitsuReviewPanel(_QWidgetBase):
         super().__init__(parent)
 
         self.model = model or KitsuReviewModel()
-        # Colored status swatches keyed by color.
+        # Colored status swatches. The key is the color.
         self._status_icon_cache = {}
-        # Revision dict behind each row of the two revision tables.
+        # The revision dict for each row of the two revision tables.
         self._checks_rows = []
         self._playlist_rows = []
-        # Which source tabs have been fetched since logging in (each is
-        # fetched the first time it's shown).
+        # The source tabs that are fetched since the login. Each tab is
+        # fetched the first time the user shows it.
         self._tab_loaded = {self.PLAYLISTS_TAB: False, self.CHECKS_TAB: False}
 
         self._build_ui()
         self._refresh_login_state()
 
-        # After the event loop has shown the panel, try the saved session.
+        # After the event loop shows the panel, try the saved session.
         QtCore.QTimer.singleShot(0, self._try_restore_session)
 
     # ------------------------------------------------------------------
@@ -179,7 +182,7 @@ class KitsuReviewPanel(_QWidgetBase):
                 "the 'keyring' package into OpenRV's Python to enable it. "
                 "Server and email are still remembered."
             )
-        # Connected after setChecked so building the UI doesn't fire it.
+        # Connect after setChecked, so that the UI build does not fire it.
         self.remember_check.toggled.connect(self._on_remember_toggled)
         top_bar.addWidget(self.remember_check)
 
@@ -192,8 +195,8 @@ class KitsuReviewPanel(_QWidgetBase):
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         root.addWidget(splitter, stretch=1)
 
-        # Where revisions come from: the Playlists tab (main) or My Checks.
-        # Both feed the same detail panel on the right.
+        # The revisions come from the Playlists tab (main) or My Checks.
+        # Both tabs supply the same detail panel on the right.
         self.source_tabs = QtWidgets.QTabWidget()
         self.source_tabs.addTab(self._build_playlists_tab(), "Playlists")
         self.source_tabs.addTab(self._build_checks_tab(), "My Checks")
@@ -294,8 +297,10 @@ class KitsuReviewPanel(_QWidgetBase):
         return label
 
     def _build_playlists_tab(self):
-        """Main tab: the productions' playlists, and the shots of the
-        selected one."""
+        """
+        Main tab: the playlists of the productions, and the shots of the
+        selected playlist.
+        """
         tab = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(tab)
 
@@ -338,7 +343,9 @@ class KitsuReviewPanel(_QWidgetBase):
         return tab
 
     def _build_checks_tab(self):
-        """Secondary tab: the latest revision of each of the user's tasks."""
+        """
+        Secondary tab: the latest revision of each task of the user.
+        """
         tab = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(tab)
         layout.addWidget(
@@ -359,8 +366,10 @@ class KitsuReviewPanel(_QWidgetBase):
         return tab
 
     def _build_dev_tab(self):
-        """Developer view: the annotations of whatever is in the RV
-        viewport right now, dumped as JSON."""
+        """
+        Developer view: the annotations of the content that is in the RV
+        viewport now, as JSON.
+        """
         dev = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(dev)
 
@@ -451,7 +460,8 @@ class KitsuReviewPanel(_QWidgetBase):
             self._dev_timer.stop()
 
     def _on_dev_timer(self):
-        # The dock can be hidden while the tab stays selected; skip work then.
+        # The dock can be hidden while the tab stays selected. Do no work
+        # then.
         if not self.isVisible():
             return
         if self.dev_view_combo.currentData() == DevView.SERVER:
@@ -473,8 +483,9 @@ class KitsuReviewPanel(_QWidgetBase):
             self.dev_view_combo.currentData(), self.dev_scope_check.isChecked()
         )
 
-        # Only touch the widget when the content changed, so auto-refresh
-        # doesn't reset the scroll position or text selection every second.
+        # Change the widget only when the content changed. If not, the
+        # automatic refresh resets the scroll position and the text
+        # selection every second.
         if text != self.dev_json_view.toPlainText():
             v_bar = self.dev_json_view.verticalScrollBar()
             h_bar = self.dev_json_view.horizontalScrollBar()
@@ -557,7 +568,7 @@ class KitsuReviewPanel(_QWidgetBase):
             return
 
         self.login_btn.setEnabled(True)
-        # Don't keep the password around in the widget once it's been used.
+        # Do not keep the password in the widget after the login uses it.
         self.pass_field.clear()
 
         self.model.complete_login(user, server, email)
@@ -578,7 +589,9 @@ class KitsuReviewPanel(_QWidgetBase):
         self.model.set_remember(checked)
 
     def _try_restore_session(self):
-        """Log back in with the session saved by "Remember me", if any."""
+        """
+        Log in again with the session that "Remember me" saved, if any.
+        """
         if self.model.logged_in or not self.remember_check.isChecked():
             return
         server = normalize_server(self.server_field.text())
@@ -616,7 +629,11 @@ class KitsuReviewPanel(_QWidgetBase):
     # ------------------------------------------------------------------
 
     def _status_icon(self, status):
-        """Small rounded swatch in the status's Kitsu color (cached)."""
+        """
+        Return a small rounded swatch in the Kitsu color of the status.
+
+        The swatch is cached.
+        """
         color = _status_qcolor(status)
         key = color.name()
         icon = self._status_icon_cache.get(key)
@@ -637,8 +654,10 @@ class KitsuReviewPanel(_QWidgetBase):
         return icon
 
     def _populate_status_combo(self):
-        """Fill the status dropdown for the selected revision's task and
-        preselect the task's current status."""
+        """
+        Fill the status dropdown for the task of the selected revision.
+        Preselect the current status of the task.
+        """
         self.status_combo.blockSignals(True)
         self.status_combo.clear()
         rev = self.model.current_revision
@@ -662,8 +681,13 @@ class KitsuReviewPanel(_QWidgetBase):
         self._update_comment_button()
 
     def _selected_status_id(self):
-        """Status chosen in the dropdown, or the task's current status when
-        the dropdown is empty (e.g. the status catalog failed to load)."""
+        """
+        Return the status chosen in the dropdown.
+
+        If the dropdown is empty, return the current status of the task.
+        The dropdown is empty, for example, when the status catalog did
+        not load.
+        """
         rev = self.model.current_revision
         if not rev:
             return None
@@ -686,8 +710,11 @@ class KitsuReviewPanel(_QWidgetBase):
         )
 
     def _set_status_cell(self, table, row, rev):
-        """Status text and swatch; revisions waiting on review are shown
-        in bold."""
+        """
+        Set the status text and swatch.
+
+        Show the revisions that wait for review in bold.
+        """
         item = _table_cell(table, row, self.STATUS_COLUMN)
         item.setText(str(rev["status"]))
         status = self.model.status_for_id(rev["task"].get("task_status_id"))
@@ -702,9 +729,13 @@ class KitsuReviewPanel(_QWidgetBase):
         _set_bold(table, row, (self.SHOT_COLUMN, self.STATUS_COLUMN), pending)
 
     def _refresh_status_cells(self):
-        """Redraw every listed revision's status (after a status change,
-        which can touch the same task on both tabs) and the playlists'
-        to-review counts."""
+        """
+        Draw again the status of each listed revision, and the to-review
+        counts of the playlists.
+
+        Do this after a status change. A status change can affect the same
+        task on both tabs.
+        """
         for table, rows in (
             (self.checks_table, self._checks_rows),
             (self.playlist_rev_table, self._playlist_rows),
@@ -794,16 +825,21 @@ class KitsuReviewPanel(_QWidgetBase):
             self._on_refresh_playlists_clicked()
 
     def _on_source_tab_changed(self, index):
-        """Fetch a tab the first time it's shown, and point the detail panel
-        at whatever is selected on the tab now in front."""
+        """
+        Fetch a tab the first time it is shown.
+
+        Point the detail panel at the selection on the tab that is now in
+        front.
+        """
         if self.model.logged_in and not self._tab_loaded.get(index):
             self._refresh_source_tab(index)
             return
         self._on_revision_selected(self._current_revision_table())
 
     def _on_revision_selected(self, table):
-        # A table on the hidden tab keeps its selection but doesn't drive
-        # the detail panel; switching tabs re-syncs it.
+        # A table on the hidden tab keeps its selection but does not
+        # control the detail panel. When the user changes tabs, the panel
+        # synchronizes again.
         if table is not self._current_revision_table():
             return
         rows = table.selectionModel().selectedRows()
@@ -820,8 +856,11 @@ class KitsuReviewPanel(_QWidgetBase):
     # -- My Checks ------------------------------------------------------
 
     def _on_refresh_checks_clicked(self):
-        """Pull the current user's tasks from Kitsu and list the latest
-        revision (preview file) of each."""
+        """
+        Get the tasks of the current user from Kitsu.
+
+        List the latest revision (preview file) of each task.
+        """
         if not self.model.logged_in or not self.model.current_user:
             return
 
@@ -848,7 +887,9 @@ class KitsuReviewPanel(_QWidgetBase):
     # -- Playlists ------------------------------------------------------
 
     def _on_refresh_playlists_clicked(self):
-        """List the playlists of the user's open productions."""
+        """
+        List the playlists of the open productions of the user.
+        """
         if not self.model.logged_in or not self.model.current_user:
             return
 
@@ -892,9 +933,14 @@ class KitsuReviewPanel(_QWidgetBase):
             self._clear_detail_panel()
 
     def _set_playlist_pending_cell(self, row):
-        """ "To review" cell: pending / reviewable entries. Before a playlist
-        is opened the pending count is an estimate (from the tasks awaiting
-        review on its shots); opening it makes it exact."""
+        """
+        Set the "To review" cell: pending entries / reviewable entries.
+
+        Before the user opens a playlist, the pending count is an estimate.
+        The estimate comes from the tasks that wait for review on the
+        shots of the playlist.
+        When the user opens the playlist, the count is exact.
+        """
         if row >= len(self.model.playlists):
             return
         summary = self.model.playlists[row]
@@ -925,13 +971,17 @@ class KitsuReviewPanel(_QWidgetBase):
 
     @staticmethod
     def _playlist_is_pending(summary):
-        # Unknown counts stay visible rather than hiding work.
+        # Unknown counts stay visible. This does not hide work.
         return summary["pending_count"] is None or summary["pending_count"] > 0
 
     def _apply_playlist_filter(self):
-        """Hide playlists with nothing to review unless "Show all" is on.
-        The selected playlist always stays visible, so a review that brings
-        its count to zero doesn't pull it out from under the reviewer."""
+        """
+        Hide the playlists with nothing to review, unless "Show all" is on.
+
+        The selected playlist always stays visible. A review can bring its
+        count to zero. The playlist does not then disappear from under the
+        reviewer.
+        """
         show_all = self.show_all_playlists_check.isChecked()
         selected = {
             i.row()
@@ -1057,7 +1107,8 @@ class KitsuReviewPanel(_QWidgetBase):
         self._populate_status_combo()
 
         self.download_btn.setEnabled(True)
-        # Export needs the revision loaded into RV (its frame base and size).
+        # Export needs the revision loaded into RV (its frame base and
+        # size).
         self.export_btn.setEnabled(
             bool(self.model.current_revision.get("loaded"))
         )
@@ -1065,8 +1116,11 @@ class KitsuReviewPanel(_QWidgetBase):
         self._refresh_dev_view_if_active()
 
     def _reload_comments(self):
-        """Show the selected revision's task comments, each tagged with the
-        status it was posted with."""
+        """
+        Show the comments of the task of the selected revision.
+
+        Tag each comment with the status that the user posted with it.
+        """
         self.comments_list.clear()
         rev = self.model.current_revision
         if not rev:
@@ -1099,10 +1153,15 @@ class KitsuReviewPanel(_QWidgetBase):
     # ------------------------------------------------------------------
 
     def _on_add_comment_clicked(self):
-        """Post a comment with the status chosen in the dropdown. Picking a
-        different status changes the task status; leaving it on the current
-        one keeps it as is. A status change may be posted without any text,
-        as in Kitsu's own UI."""
+        """
+        Post a comment with the status chosen in the dropdown.
+
+        If the user picks a different status, the task status changes.
+        If the user leaves the current status, the task status stays the
+        same.
+        The user can post a status change without text, as in the Kitsu
+        UI.
+        """
         rev = self.model.current_revision
         if not rev:
             return
@@ -1142,8 +1201,11 @@ class KitsuReviewPanel(_QWidgetBase):
         self._reload_comments()
 
     def _on_download_clicked(self):
-        """Download the selected revision, load it into RV and re-apply
-        the annotations Kitsu already has for it."""
+        """
+        Download the selected revision and load it into RV.
+
+        Then apply again the annotations that Kitsu already has for it.
+        """
         rev = self.model.current_revision
         if not rev:
             return
@@ -1236,7 +1298,9 @@ class KitsuReviewPanel(_QWidgetBase):
 
 
 class KitsuReviewMode(_MinorModeBase):
-    """OpenRV MinorMode that docks a 'Kitsu Review' panel below the viewport."""
+    """
+    OpenRV MinorMode that docks a 'Kitsu Review' panel below the viewport.
+    """
 
     def __init__(self):
         rv.rvtypes.MinorMode.__init__(self)
@@ -1282,7 +1346,10 @@ class KitsuReviewMode(_MinorModeBase):
 
 
 def createMode():
-    """Entry point OpenRV calls to instantiate this plugin's mode."""
+    """
+    Entry point that OpenRV calls to make an instance of the mode of this
+    plugin.
+    """
     if not _INSIDE_OPENRV:
         raise RuntimeError(
             "createMode() requires OpenRV's embedded Python environment "

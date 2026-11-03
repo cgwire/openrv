@@ -1,10 +1,12 @@
-"""Core logic for the Kitsu Review OpenRV plugin.
+"""
+Core logic for the Kitsu Review OpenRV plugin.
 
-Everything that isn't UI lives here: talking to Kitsu through gazu,
-persisting the login session, the task-status rules, and reading/writing
-annotations in the RV session's paint nodes. No widgets are created in
-this module -- kitsu.py owns the panel and calls into
-KitsuReviewModel from its handlers.
+This module holds all logic that is not UI. It uses gazu to talk to Kitsu. It
+saves the login session. It holds the task status rules. It reads and writes
+annotations in the paint nodes of the RV session.
+
+This module creates no widgets. `kitsu.py` owns the panel. It calls
+`KitsuReviewModel` from its handlers.
 """
 
 from __future__ import annotations
@@ -35,8 +37,8 @@ except ImportError:
     _INSIDE_OPENRV = False
 
 # Optional: the OS credential store (macOS Keychain, Windows Credential
-# Manager, Secret Service / KWallet on Linux). Without it, "Remember me"
-# is unavailable and only the server URL and email are remembered.
+# Manager, Secret Service / KWallet on Linux). Without it, "Remember me" is
+# unavailable. The app remembers only the server URL and the email.
 try:
     import keyring
     import keyring.errors
@@ -50,8 +52,9 @@ DEFAULT_SERVER = "http://localhost/api"
 SETTINGS_ORG = "KitsuReview"
 SETTINGS_APP = "OpenRVPlugin"
 KEYRING_SERVICE = "kitsu-review-openrv"
-# Stored as separate credential entries: Windows Credential Manager caps
-# a single secret at ~1280 characters, which two JWTs together can exceed.
+# Store the tokens as separate credential entries. Windows Credential Manager
+# limits a single secret to about 1280 characters. Two JWTs together can be
+# more than that.
 _TOKEN_KINDS = ("access_token", "refresh_token")
 
 _FRAME_ORDER_RE = re.compile(r"\bframe:(\d+)\b.*\.order$")
@@ -72,33 +75,40 @@ _STILL_EXTENSIONS = {
     "webp",
 }
 
-# Kitsu roles whose comments are limited to statuses flagged
-# "is_artist_allowed" / "is_client_allowed". Supervisors, managers and
-# admins may use any status. The server enforces this too; filtering here
-# just keeps statuses the user can't set out of the dropdown.
+# These Kitsu roles can comment only with statuses that have the flag
+# "is_artist_allowed" or "is_client_allowed". Supervisors, managers and admins
+# can use any status. The server also enforces this. The filter here keeps the
+# dropdown free of statuses that the user cannot set.
 _ARTIST_ROLES = {"user", "vendor"}
 _CLIENT_ROLES = {"client"}
 
 STATUS_FALLBACK_COLOR = "#9e9e9e"
 
-# Safety cap on the pages read from Kitsu's paged per-project playlist route.
+# Safety limit for the number of pages read from the paged Kitsu route for the
+# playlists of a project.
 _PLAYLIST_MAX_PAGES = 50
 
 
 class DevView:
-    """Keys for the Dev tab's views (the view maps them to labels)."""
+    """
+    Keys for the views of the Dev tab. The view maps them to labels.
+    """
 
     RV = "rv"  # raw OpenRV paint properties
-    CONVERTED = "converted"  # converted to Kitsu format (export preview)
-    SERVER = "server"  # stored on Kitsu for the selected revision
+    CONVERTED = "converted"  # data in Kitsu format (export preview)
+    SERVER = "server"  # data that Kitsu stores for the selected revision
 
 
 class SessionRejected(Exception):
-    """A saved Kitsu session the server no longer accepts."""
+    """
+    A saved Kitsu session that the server does not accept any more.
+    """
 
 
 class DimensionsUnknownError(ValueError):
-    """A preview's pixel size couldn't be determined from any source."""
+    """
+    The pixel size of a preview could not be found from any source.
+    """
 
 
 # ----------------------------------------------------------------------
@@ -111,12 +121,16 @@ def log(message):
 
 
 def _preview_revision(preview_file):
-    """Best-effort revision number for a gazu preview file dict."""
+    """
+    Return a best-effort revision number for a gazu preview file dict.
+    """
     return preview_file.get("revision", 0) or 0
 
 
 def _format_date(value):
-    """Kitsu timestamps are ISO 8601 strings (or None) -- normalize for display."""
+    """
+    Kitsu timestamps are ISO 8601 strings (or None). Convert them for display.
+    """
     if not value:
         return "-"
     try:
@@ -128,7 +142,10 @@ def _format_date(value):
 
 
 def person_display_name(person):
-    """Best-effort display name for a gazu person dict (comments embed one)."""
+    """
+    Return a best-effort display name for a gazu person dict. Comments contain
+    such a dict.
+    """
     if not person or not isinstance(person, dict):
         return "Unknown"
     first = person.get("first_name", "") or ""
@@ -138,7 +155,9 @@ def person_display_name(person):
 
 
 def status_short_label(status):
-    """Compact tag for a task status, e.g. "WIP" or "RETAKE"."""
+    """
+    Return a short tag for a task status, for example "WIP" or "RETAKE".
+    """
     if not status:
         return "?"
     short = status.get("short_name") or ""
@@ -156,18 +175,22 @@ def normalize_server(url):
 
 
 def _thumbnail_url(preview_file_id):
-    """Best-effort Kitsu thumbnail URL for a preview file.
+    """
+    Return a best-effort Kitsu thumbnail URL for a preview file.
 
-    Goes through the configured host, like the rest of the gazu API.
+    The URL uses the configured host, as the rest of the gazu API does.
     """
     host = gazu.client.get_host()
     return f"{host}/pictures/originals/preview-files/{preview_file_id}.png"
 
 
 def _parse_fps(value):
-    """A production's frame rate as a float, or None if it isn't set or
-    isn't a usable number. Kitsu stores it as a string, e.g. "25" or
-    "23.976"."""
+    """
+    Return the frame rate of a production as a float. Return None if it is not
+    set or is not a usable number.
+
+    Kitsu stores it as a string, for example "25" or "23.976".
+    """
     if value is None:
         return None
     try:
@@ -178,12 +201,15 @@ def _parse_fps(value):
 
 
 def format_fps(fps):
-    """Compact display form: 25 -> "25", 23.976 -> "23.976"."""
+    """
+    Return a short display form: 25 -> "25", 23.976 -> "23.976".
+    """
     return f"{fps:g}" if fps else "?"
 
 
 def _is_still(preview_file):
-    """True if this preview is a single picture rather than a movie.
+    """
+    Return True if this preview is a single picture and not a movie.
 
     Kitsu records "extension" without a leading dot.
     """
@@ -194,9 +220,11 @@ def _is_still(preview_file):
 
 
 def _normalize_full_task(task):
-    """gazu.task.get_task() returns the "full" task, with its type, status,
-    entity and project nested as dicts. Fill in the flat keys the rest of
-    the plugin reads (task_type_name, task_status_id, ...) from those."""
+    """
+    `gazu.task.get_task()` returns the "full" task. Its type, status, entity
+    and project are nested dicts. Set the flat keys that the rest of the plugin
+    reads (`task_type_name`, `task_status_id`, ...) from those dicts.
+    """
     task = dict(task or {})
     flat_from_nested = (
         ("task_type_id", "task_type", "id"),
@@ -215,7 +243,10 @@ def _normalize_full_task(task):
 
 
 def _entity_label(task, entity):
-    """Shot label as Kitsu shows it in playlists, e.g. "SQ010 / SH0040"."""
+    """
+    Return the shot label as Kitsu shows it in playlists, for example "SQ010 /
+    SH0040".
+    """
     name = (entity or {}).get("name") or task.get("entity_name") or "Unknown"
     sequence = task.get("sequence")
     sequence_name = (
@@ -225,18 +256,23 @@ def _entity_label(task, entity):
 
 
 def _json_default(value):
-    """Fallback for json.dumps on values RV/gazu hand back that aren't
-    natively JSON-serializable (sets, custom objects, ...)."""
+    """
+    Fallback for `json.dumps` for values from RV or gazu that JSON cannot
+    serialize natively (sets, custom objects, ...).
+    """
     if isinstance(value, (set, frozenset)):
         return sorted(value, key=str)
     return str(value)
 
 
 def _auth_error_types():
-    """gazu exceptions meaning "the server rejected these credentials", as
-    opposed to "the server couldn't be reached". Looked up by name since
-    the set differs slightly between gazu versions. KeyError covers a
-    refresh response that came back without a new access token."""
+    """
+    Return the gazu exceptions that mean "the server rejected these
+    credentials". They do not mean "the server could not be reached".
+
+    Look them up by name, because the set is a little different in each gazu
+    version. `KeyError` covers a refresh response that has no new access token.
+    """
     names = (
         "NotAuthenticatedException",
         "NotAllowedException",
@@ -251,12 +287,14 @@ def _auth_error_types():
 
 
 def _current_gazu_tokens():
-    """The gazu client's current session tokens as a plain dict.
+    """
+    Return the current session tokens of the gazu client as a plain dict.
 
-    gazu has no public getter for the whole token dict (only
-    get_access_token / get_refresh_token on newer versions), so read the
-    default client's `tokens` attribute, which every version has, and
-    fall back to the per-token getters."""
+    gazu has no public getter for the whole token dict. Newer versions have
+    only `get_access_token` and `get_refresh_token`. So read the `tokens`
+    attribute of the default client, which every version has. If it is not
+    available, use the getter for each token.
+    """
     client = getattr(gazu.client, "default_client", None)
     tokens = getattr(client, "tokens", None)
     if isinstance(tokens, dict):
@@ -276,9 +314,11 @@ def _current_gazu_tokens():
 
 
 def _dimensions_from_file(file_path):
-    """Read pixel dimensions off a downloaded file, or None if that isn't
-    possible (unsupported/unreadable format, or running outside OpenRV
-    where Qt's image loaders aren't available)."""
+    """
+    Read the pixel dimensions from a downloaded file. Return None if this is
+    not possible. This happens with an unsupported or unreadable format. It
+    also happens outside OpenRV, where the Qt image loaders are not available.
+    """
     if not _INSIDE_OPENRV or not file_path or not os.path.exists(file_path):
         return None
     image = QtGui.QImage(file_path)
@@ -321,13 +361,15 @@ def _preview_dimensions(preview_file, entity=None, file_path=None):
 
 
 class _SessionStore:
-    """Persists login details between OpenRV sessions.
+    """
+    Save the login details between OpenRV sessions.
 
-    Server URL, email and the "Remember me" choice aren't secret and go in
-    QSettings. The Kitsu session tokens go in the OS credential store via
-    `keyring`. The password itself is never stored anywhere: logging in
-    exchanges it for tokens, and those are what get reused. Tokens expire
-    on the server and are revoked by Log Out.
+    The server URL, the email and the "Remember me" choice are not secret. They
+    go in QSettings. The Kitsu session tokens go in the OS credential store
+    through `keyring`.
+
+    The app never stores the password. A login exchanges it for tokens, and the
+    app reuses those tokens. Tokens expire on the server. Log Out revokes them.
     """
 
     def __init__(self):
@@ -356,8 +398,11 @@ class _SessionStore:
 
     @staticmethod
     def secure_available():
-        """True if keyring is installed and has a real backend (not the
-        "fail" backend it falls back to on e.g. headless Linux)."""
+        """
+        Return True if keyring is installed and has a real backend. Return
+        False for the "fail" backend that keyring uses on, for example,
+        headless Linux.
+        """
         if keyring is None:
             return False
         try:
@@ -374,7 +419,7 @@ class _SessionStore:
         try:
             keyring.delete_password(KEYRING_SERVICE, account)
         except keyring.errors.PasswordDeleteError:
-            pass  # nothing stored under that name
+            pass  # nothing is stored under that name
 
     def load_tokens(self, server, email):
         if not self.secure_available():
@@ -427,8 +472,10 @@ class _SessionStore:
 
 
 class RvSession:
-    """Reads and writes the open RV session: sources, frame ranges and
-    the paint-node properties RV stores annotations in."""
+    """
+    Read and write the open RV session: sources, frame ranges and the
+    paint-node properties where RV stores annotations.
+    """
 
     _GROUPED_KEYS = {
         "points": 2,
@@ -458,10 +505,12 @@ class RvSession:
 
     @staticmethod
     def set_fps(fps, source_node=None):
-        """Make RV play at `fps`. When a source is given, its media is also
-        pinned to that rate (the RVFileSource's group.fps override), so RV
-        counts frames the same way Kitsu does and the setting survives RV
-        re-deriving the playback rate when the view changes."""
+        """
+        Make RV play at `fps`. If a source is given, also pin its media to that
+        rate (the `group.fps` override of the RVFileSource). Then RV counts
+        frames as Kitsu does. The setting also stays when RV derives the
+        playback rate again after the view changes.
+        """
         if source_node:
             prop = f"{source_node}.group.fps"
             try:
@@ -482,9 +531,11 @@ class RvSession:
 
     @staticmethod
     def source_start_frame(source_node, default=1):
-        """First frame of a source in the current session. A still image
-        occupies exactly one frame, which is where Kitsu's frameless
-        annotations have to land."""
+        """
+        Return the first frame of a source in the current session. A still
+        image uses exactly one frame. The frameless annotations of Kitsu must
+        go on that frame.
+        """
         try:
             info = rvc.nodeRangeInfo(source_node) or {}
         except Exception as exc:
@@ -498,19 +549,22 @@ class RvSession:
 
     @staticmethod
     def paint_nodes_for_source(source_group):
-        """Every RVPaint node that draws on one source, upstream first.
+        """
+        Return every RVPaint node that draws on one source, upstream first.
 
-        That's the paint node inside the source's own group, then the
-        per-input paint nodes RV puts in each sequence/retime/switch group
-        that source feeds ("<group>_p_<sourceGroup>"). RV's annotate mode
-        draws on the first paint node it finds from the view down, so in
-        a sequence view, strokes made in RV land in "defaultSequence_p_..."
-        rather than in the source's own paint node. Those per-input nodes
-        sit before the retime, so their frames are source frames too.
+        First comes the paint node in the group of the source. Then come the
+        per-input paint nodes that RV puts in each sequence, retime or switch
+        group that the source feeds ("<group>_p_<sourceGroup>").
 
-        RV renders every paint node's strokes into one list, upstream node
-        first, so an eraser in a downstream node erases strokes from the
-        source's node. Reading the nodes in this order keeps that true.
+        The annotate mode of RV draws on the first paint node that it finds
+        from the view downward. So in a sequence view, the strokes made in RV
+        go in "defaultSequence_p_..." and not in the paint node of the source.
+        Those per-input nodes are before the retime, so their frames are source
+        frames too.
+
+        RV renders the strokes of all paint nodes into one list, upstream node
+        first. So an eraser in a downstream node erases strokes from the node
+        of the source. Read the nodes in this order to keep this true.
         """
         try:
             all_paint = list(rvc.nodesOfType("RVPaint") or [])
@@ -533,9 +587,11 @@ class RvSession:
 
     @staticmethod
     def _pipeline_order(paint_nodes):
-        """Paint nodes with those inside source groups first: they're
-        upstream of any view-level paint node, so RV draws their strokes
-        first (see `paint_nodes_for_source`)."""
+        """
+        Return the paint nodes with those in source groups first. They are
+        upstream of any view-level paint node, so RV draws their strokes first
+        (see `paint_nodes_for_source`).
+        """
 
         def is_view_level(node):
             try:
@@ -546,11 +602,12 @@ class RvSession:
         return sorted(paint_nodes, key=is_view_level)
 
     def current_source_paint_nodes(self):
-        """(sources, paint_nodes) for the source(s) under the playhead.
+        """
+        Return (sources, paint_nodes) for the sources under the playhead.
 
-        In a stack/layout view several sources can be visible at once, so
-        all of them are returned, with every paint node that draws on each
-        (see `paint_nodes_for_source`).
+        In a stack or layout view, several sources can be visible at once. So
+        return all of them, with every paint node that draws on each (see
+        `paint_nodes_for_source`).
         """
         try:
             sources = list(rvc.sourcesAtFrame(rvc.frame()) or [])
@@ -583,15 +640,19 @@ class RvSession:
 
     @staticmethod
     def _color_float(color, default=(255, 255, 255, 255)):
-        """A convertToORV color (flat [r, g, b, a], 0..255) as the 0..1
-        floats RV paint properties hold."""
+        """
+        Convert a color from `convertToORV` (flat [r, g, b, a], 0..255) to the
+        0..1 floats that RV paint properties hold.
+        """
         color = color or list(default)
         if isinstance(color[0], (list, tuple)):
             color = color[0]
         return [c / 255.0 for c in color]
 
     def _set_props(self, base, specs):
-        """Write (attribute, type, width, values) specs, in order."""
+        """
+        Write the (attribute, type, width, values) specs in order.
+        """
         for attr, ptype, width, values in specs:
             self._set_prop(f"{base}.{attr}", ptype, width, values)
 
@@ -648,17 +709,23 @@ class RvSession:
                 ("join", rvc.IntType, 1, [3]),
                 ("cap", rvc.IntType, 1, [1]),
                 ("splat", rvc.IntType, 1, [0]),
-                # 0 paints, 1 erases what's drawn before it (Kitsu erasers).
+                # 0 paints. 1 erases what the earlier strokes drew (Kitsu
+                # erasers).
                 ("mode", rvc.IntType, 1, [int(props.get("mode") or 0)]),
                 *self._uuid_specs(props),
             ],
         )
 
     def _write_box(self, base, frame, props):
-        """The same properties RV writes for an ellipse or rect drawn with
-        its own annotate tools (see a gathered RV shape in the Dev tab);
-        the two share one property set and differ only in the component
-        name's "ellipse:"/"rect:" prefix."""
+        """
+        Write the properties that RV writes for its own ellipse or rect.
+
+        RV writes them when you draw with its annotate tools. To see them,
+        look at a gathered RV shape in the Dev tab.
+
+        The two shapes share one property set. They differ only in the prefix
+        "ellipse:" or "rect:" of the component name.
+        """
         inner = self._color_float(
             props.get("innerColor"), default=(255, 255, 255, 0)
         )
@@ -679,10 +746,12 @@ class RvSession:
         )
 
     def _write_arrow(self, base, frame, props):
-        """The same properties RV writes for an arrow drawn with its own
-        annotate tool: tail at startPos, head at endPos, the line width as
-        both thickness and borderWidth, the color in borderColor and
-        innerColor."""
+        """
+        Write the same properties that RV writes for an arrow drawn with its
+        own annotate tool. The tail is at `startPos` and the head is at
+        `endPos`. The line width is both `thickness` and `borderWidth`. The
+        color is in `borderColor` and `innerColor`.
+        """
         border = self._color_float(props.get("borderColor"))
         inner = (
             self._color_float(props["innerColor"])
@@ -711,11 +780,13 @@ class RvSession:
         )
 
     def _write_text(self, base, frame, props):
-        """The same properties RV writes for text placed with its own
-        annotate tool: position is the left end of the first baseline,
-        fontSize the text height as a fraction of the image height, and
-        size the legacy equivalent older RV builds read (fontSize / 12.5
-        at scale 1)."""
+        """
+        Write the same properties that RV writes for text placed with its own
+        annotate tool. `position` is the left end of the first baseline.
+        `fontSize` is the text height as a fraction of the image height. `size`
+        is the legacy equivalent that older RV builds read (`fontSize` / 12.5
+        at scale 1).
+        """
         position = props["position"]
         if isinstance(position[0], (list, tuple)):
             position = position[0]
@@ -775,8 +846,10 @@ class RvSession:
     }
 
     def apply_annotations_live(self, paint_node, openrv_annotations):
-        """openrv_annotations: flat list of shapes as returned by
-        convertToORV(), i.e. [{"type", "frame", "properties"}, ...]."""
+        """
+        openrv_annotations: flat list of shapes as returned by
+        `convertToORV()`, that is [{"type", "frame", "properties"}, ...].
+        """
         self._set_prop(f"{paint_node}.paint.show", rvc.IntType, 1, [1])
 
         next_id = 0
@@ -831,8 +904,11 @@ class RvSession:
 
     @classmethod
     def _shaped_value(cls, attr, value):
-        """A raw flat property value as the shape dicts hold it: grouped
-        (points, colors, ...), or unwrapped when it's a single value."""
+        """
+        Convert a raw flat property value to the form that the shape dicts
+        hold. Group it (points, colors, ...), or unwrap it if it is a single
+        value.
+        """
         if not isinstance(value, list):
             return value
         group_size = cls._GROUPED_KEYS.get(attr)
@@ -862,15 +938,16 @@ class RvSession:
         return [order] if isinstance(order, str) else order
 
     def gather_annotations(self, paint_nodes=None):
-        """Read annotation shapes out of RV paint nodes.
+        """
+        Read annotation shapes from RV paint nodes.
 
-        paint_nodes: list of RVPaint node names to read, upstream first
-        (as `paint_nodes_for_source` returns them), or None to read every
-        paint node in the session.
+        paint_nodes: list of RVPaint node names to read, upstream first (as
+        `paint_nodes_for_source` returns them). If it is None, read every paint
+        node in the session.
 
-        Shapes come out per frame in drawing order: the nodes in the order
-        given, each node in its own frame order. The order matters for
-        erasers, which only cut what is drawn before them.
+        Shapes come out per frame in drawing order: the nodes in the given
+        order, and each node in its own frame order. The order matters for
+        erasers, which cut only what is drawn before them.
         """
         annotations = []
 
@@ -918,11 +995,12 @@ class RvSession:
 
 
 class KitsuReviewModel:
-    """State and operations behind the Kitsu Review panel.
+    """
+    State and operations behind the Kitsu Review panel.
 
-    Methods raise on failures the user needs to hear about and leave the
-    reporting to the view; failures that are only worth a log line are
-    printed here and swallowed.
+    Methods raise an error for failures that the user must know about. The view
+    reports them. For failures that need only a log line, the method prints the
+    line here and does not raise.
     """
 
     def __init__(self):
@@ -932,17 +1010,19 @@ class KitsuReviewModel:
         self.logged_in = False
         self.current_user = None
         self.current_revision = None
-        # "My Checks" tab: the latest revision of each of the user's tasks.
+        # "My Checks" tab: the latest revision of each task of the user.
         self.check_revisions: List[Dict[str, Any]] = []
-        # "Playlists" tab: one summary per playlist of the user's open
-        # productions, and each opened playlist's revisions by playlist id.
+        # "Playlists" tab: one summary for each playlist of the open
+        # productions of the user. Also the revisions of each opened playlist,
+        # by playlist id.
         self.playlists: List[Dict[str, Any]] = []
         self._playlist_revisions: Dict[str, List[Dict[str, Any]]] = {}
         self._thumbnail_cache: Dict[str, Optional[bytes]] = {}
 
-        # Task status and task type catalogs (id -> dict), and the project
-        # (production) records, which carry each project's status subset
-        # and frame rate. A failed fetch is cached as None.
+        # Catalogs of task statuses and task types (id -> dict). Also the
+        # project (production) records. Each project record has the subset of
+        # statuses and the frame rate of the project. A failed fetch is cached
+        # as None.
         self._task_statuses: Dict[str, Dict[str, Any]] = {}
         self._task_types: Dict[str, Dict[str, Any]] = {}
         self._project_cache: Dict[str, Optional[Dict[str, Any]]] = {}
@@ -968,7 +1048,9 @@ class KitsuReviewModel:
         return self.store.load_identity()
 
     def display_name(self):
-        """Best-effort display name from the gazu user dict."""
+        """
+        Return a best-effort display name from the gazu user dict.
+        """
         return (
             person_display_name(self.current_user)
             if self.current_user
@@ -976,17 +1058,21 @@ class KitsuReviewModel:
         )
 
     def authenticate(self, server, email, password):
-        """Exchange a password for a Kitsu session; returns the user."""
+        """
+        Exchange a password for a Kitsu session. Return the user.
+        """
         gazu.set_host(server)
         return gazu.log_in(email, password)
 
     def complete_login(self, user, server, email):
-        """Shared tail of a password login and a restored session."""
+        """
+        Do the shared last steps of a password login and of a restored session.
+        """
         if isinstance(user, dict) and "user" in user:
             user = user["user"]
 
-        # Keep at most one saved session: drop the previous identity's
-        # tokens when someone logs in as a different user/server.
+        # Keep at most one saved session. When a different user or server logs
+        # in, delete the tokens of the previous identity.
         prev_server, prev_email = self.store.load_identity()
         if (prev_server, prev_email) != (server, email):
             self.store.clear_tokens(prev_server, prev_email)
@@ -1001,8 +1087,8 @@ class KitsuReviewModel:
         self.persist_session()
 
     def log_out(self):
-        # Remove the saved session first so a failed server call can't
-        # leave it behind; log_out() then revokes the token on the server.
+        # Remove the saved session first, so a failed server call cannot leave
+        # it. Then `log_out()` revokes the token on the server.
         if self._session_server and self._session_email:
             self.store.clear_tokens(self._session_server, self._session_email)
         try:
@@ -1028,8 +1114,10 @@ class KitsuReviewModel:
 
     @staticmethod
     def _enable_gazu_auto_refresh():
-        """Let gazu renew an expired access token on its own mid-session,
-        on gazu versions that support it."""
+        """
+        Let gazu renew an expired access token by itself during a session, on
+        the gazu versions that support it.
+        """
         client = getattr(gazu.client, "default_client", None)
         if client is not None and hasattr(client, "automatic_refresh_token"):
             client.automatic_refresh_token = True
@@ -1042,9 +1130,11 @@ class KitsuReviewModel:
             pass
 
     def persist_session(self):
-        """Save (or, with "Remember me" off, remove) the current gazu
-        tokens in the credential store. Cheap to call repeatedly: it only
-        writes when the tokens actually changed, e.g. after a refresh."""
+        """
+        Save the current gazu tokens in the credential store. If "Remember me"
+        is off, remove them. It is cheap to call many times: it writes only
+        when the tokens changed, for example after a refresh.
+        """
         if not self.logged_in or not self._session_server:
             return
         if not (self.remember and self.store.secure_available()):
@@ -1056,16 +1146,17 @@ class KitsuReviewModel:
         except Exception as exc:
             log(f"Could not read the current gazu session tokens: {exc}")
             return
-        # Keep only what we store, so the "unchanged?" check is stable.
+        # Keep only the tokens that we store. This makes the "unchanged?" check
+        # stable.
         tokens = {
             k: str(v) for k, v in tokens.items() if k in _TOKEN_KINDS and v
         }
         if not tokens.get("access_token"):
-            return  # nothing usable to save yet
+            return  # no usable token to save yet
 
-        # Some gazu versions replace the token dict on refresh with one that
-        # only holds the new access token. Keep the refresh token we already
-        # have; otherwise save_tokens() would delete it from the store.
+        # Some gazu versions replace the token dict on refresh with a dict that
+        # has only the new access token. Keep the refresh token that we already
+        # have. If not, `save_tokens()` deletes it from the store.
         if not tokens.get("refresh_token"):
             previous = (
                 self._saved_tokens
@@ -1092,15 +1183,18 @@ class KitsuReviewModel:
             self.persist_session()
 
     def saved_tokens(self, server, email):
-        """Tokens saved by "Remember me" for this identity, or None."""
+        """
+        Return the tokens that "Remember me" saved for this identity, or None.
+        """
         return self.store.load_tokens(server, email)
 
     def _resume_session(self, server, tokens):
-        """Reconnect with saved tokens and return the current user.
+        """
+        Reconnect with saved tokens and return the current user.
 
-        Tries the access token first, then the refresh token. Raises
-        SessionRejected if the server refuses both; network/server errors
-        propagate unchanged so the caller can keep the session for later.
+        Try the access token first, then the refresh token. Raise
+        `SessionRejected` if the server refuses both. Network and server errors
+        propagate unchanged, so the caller can keep the session for later.
         """
         auth_errors = _auth_error_types()
         gazu.set_host(server)
@@ -1110,7 +1204,7 @@ class KitsuReviewModel:
             try:
                 return gazu.client.get_current_user()
             except auth_errors:
-                pass  # expired -- fall through to the refresh token
+                pass  # expired: use the refresh token next
 
         if not tokens.get("refresh_token"):
             raise SessionRejected()
@@ -1121,12 +1215,13 @@ class KitsuReviewModel:
             raise SessionRejected() from exc
 
     def restore_session(self, server, email, tokens):
-        """Resume a saved session; returns the user.
+        """
+        Resume a saved session and return the user.
 
-        A session the server rejects (expired or revoked) is deleted so it
-        isn't retried on every launch, then SessionRejected is raised. If
-        the server just can't be reached, the session is kept for next
-        time and the original error is raised.
+        If the server rejects the session (expired or revoked), delete it so
+        the app does not retry it at each launch. Then raise `SessionRejected`.
+        If the server cannot be reached, keep the session for next time and
+        raise the original error.
         """
         try:
             return self._resume_session(server, tokens)
@@ -1144,17 +1239,20 @@ class KitsuReviewModel:
     # ------------------------------------------------------------------
 
     def _refresh_catalogs(self):
-        """Shared start of a list refresh. gazu may have renewed the access
-        token along the way, so the saved session is brought up to date;
-        statuses, task types and project setups can change on the server,
-        so they're reloaded."""
+        """
+        Do the shared first steps of a list refresh. gazu can renew the access
+        token during the refresh, so update the saved session. Statuses, task
+        types and project setups can change on the server, so load them again.
+        """
         self.persist_session()
         self._load_task_statuses()
         self._load_task_types()
         self._project_cache.clear()
 
     def _make_revision(self, task, entity, preview_file, artist, **extra):
-        """The revision dict both tabs list and the detail panel works on."""
+        """
+        Return the revision dict that both tabs list and the detail panel uses.
+        """
         fps, fps_from_project = self.project_fps(task.get("project_id"))
         rev = {
             "task": task,
@@ -1183,9 +1281,11 @@ class KitsuReviewModel:
         return rev
 
     def load_my_checks(self):
-        """Pull the current user's tasks from Kitsu and collect the latest
-        preview file of each as a reviewable revision. Raises if the task
-        list itself can't be fetched."""
+        """
+        Get the tasks of the current user from Kitsu. Collect the latest
+        preview file of each task as a reviewable revision. Raise an error if
+        the task list cannot be fetched.
+        """
         tasks = gazu.task.all_tasks_for_person(self.current_user)
         self._refresh_catalogs()
 
@@ -1229,20 +1329,27 @@ class KitsuReviewModel:
         return revisions
 
     def select_revision(self, rev):
-        """Make `rev` (a dict from either tab's list) current; None clears it."""
+        """
+        Make `rev` (a dict from the list of either tab) the current revision.
+        None clears it.
+        """
         self.current_revision = rev
         return rev
 
     def all_loaded_revisions(self):
-        """Every revision dict currently listed, on either tab."""
+        """
+        Yield every revision dict that is listed now, on either tab.
+        """
         yield from self.check_revisions
         for revisions in self._playlist_revisions.values():
             yield from revisions
 
     def is_pending_review(self, task):
-        """True if the task sits in a status that asks for feedback (Kitsu's
-        "is_feedback_request" flag, e.g. WFA), i.e. it's waiting on a
-        reviewer."""
+        """
+        Return True if the task is in a status that asks for feedback (the
+        Kitsu flag "is_feedback_request", for example WFA). Then the task waits
+        for a reviewer.
+        """
         return (task or {}).get("task_status_id") in self.feedback_status_ids()
 
     def feedback_status_ids(self):
@@ -1257,16 +1364,20 @@ class KitsuReviewModel:
     # ------------------------------------------------------------------
 
     def load_playlists(self):
-        """Every playlist of the user's open productions, most recently
-        updated first, as summaries:
+        """
+        Return every playlist of the open productions of the user, most
+        recently updated first, as summaries:
 
             {"id", "name", "project", "task_type", "for_client", "updated",
              "entries", "entry_count", "pending_count", "pending_exact"}
 
-        pending_count is the number of entries waiting on review: estimated
-        from the tasks in feedback-request statuses when listing, made exact
-        once the playlist's revisions are loaded. None means it couldn't be
-        worked out. Raises if the project list itself can't be fetched."""
+        pending_count is the number of entries that wait for review. When the
+        playlists are listed, it is an estimate from the tasks in
+        feedback-request statuses. It is exact after the revisions of the
+        playlist are loaded. None means that the count could not be found.
+
+        Raise an error if the project list cannot be fetched.
+        """
         projects = gazu.user.all_open_projects() or []
         self._refresh_catalogs()
         self._playlist_revisions.clear()
@@ -1299,9 +1410,11 @@ class KitsuReviewModel:
         return summaries
 
     def _project_playlists(self, project):
-        """All playlists of one project. The Kitsu route is paged, so pages
-        are read until one brings nothing new. A project whose playlists
-        can't be read is logged and skipped."""
+        """
+        Return all playlists of one project. The Kitsu route is paged, so read
+        pages until one page brings nothing new. Log a project whose playlists
+        cannot be read, and skip it.
+        """
         seen, result = set(), []
         for page in range(1, _PLAYLIST_MAX_PAGES + 1):
             try:
@@ -1310,7 +1423,8 @@ class KitsuReviewModel:
                     or []
                 )
             except TypeError:
-                # Older gazu without the page argument returns everything.
+                # Older gazu versions have no page argument. They return all
+                # playlists.
                 if page > 1:
                     break
                 batch = gazu.playlist.all_playlists_for_project(project) or []
@@ -1328,8 +1442,11 @@ class KitsuReviewModel:
         return result
 
     def _entities_awaiting_review(self, project_id, feedback_ids):
-        """{entity_id: {task_type_id, ...}} for the project's tasks that sit
-        in a feedback-request status, or None if they couldn't be fetched."""
+        """
+        Return {entity_id: {task_type_id, ...}} for the tasks of the project
+        that are in a feedback-request status. Return None if they could not be
+        fetched.
+        """
         index: Dict[str, set] = {}
         for status_id in feedback_ids:
             try:
@@ -1356,8 +1473,10 @@ class KitsuReviewModel:
         return index
 
     def _playlist_summary(self, light, project, awaiting):
-        """Fetch one playlist's entries and summarize it, or None if it
-        can't be read."""
+        """
+        Fetch the entries of one playlist and summarize it. Return None if it
+        cannot be read.
+        """
         entries = light.get("shots")
         playlist = light
         if not isinstance(entries, list):
@@ -1401,10 +1520,12 @@ class KitsuReviewModel:
         }
 
     def load_playlist_revisions(self, summary):
-        """The revisions a playlist puts up for review, in playlist order
-        (cached until the next playlist refresh). Returns (revisions,
-        skipped), skipped being the entries without a revision or whose
-        revision couldn't be read."""
+        """
+        Return the revisions that a playlist puts up for review, in playlist
+        order. They are cached until the next playlist refresh. Return
+        (revisions, skipped). `skipped` is the number of entries that have no
+        revision, or whose revision could not be read.
+        """
         cached = self._playlist_revisions.get(summary["id"])
         if cached is not None:
             return cached, summary.get("_skipped", 0)
@@ -1451,7 +1572,9 @@ class KitsuReviewModel:
         )
 
     def _person_name(self, person_id):
-        """Display name of the person who uploaded a revision (cached)."""
+        """
+        Return the display name of the person who uploaded a revision (cached).
+        """
         if not person_id:
             return "Unknown"
         if person_id not in self._person_cache:
@@ -1464,7 +1587,9 @@ class KitsuReviewModel:
         return self._person_cache[person_id]
 
     def _recount_pending(self, summary):
-        """Exact pending count for a playlist whose revisions are loaded."""
+        """
+        Set the exact pending count for a playlist whose revisions are loaded.
+        """
         revisions = self._playlist_revisions.get(summary["id"])
         if revisions is None:
             return
@@ -1481,13 +1606,14 @@ class KitsuReviewModel:
         )
 
     def thumbnail_bytes(self, preview_file_id):
-        """Fetch (and cache) the encoded thumbnail image for a preview file.
+        """
+        Fetch the encoded thumbnail image for a preview file, and cache it.
 
-        Kitsu's thumbnail route needs the same auth as the rest of the
-        API, so this goes through `requests` directly with gazu's own
-        auth header. Returns None (and caches that) if the thumbnail
-        can't be fetched -- a preview with no rendered thumbnail yet is
-        an expected, non-fatal case.
+        The thumbnail route of Kitsu needs the same authentication as the rest
+        of the API. So this method uses `requests` directly, with the auth
+        header of gazu. It returns None if the thumbnail cannot be fetched, and
+        caches that. A preview with no rendered thumbnail yet is an expected
+        case and is not fatal.
         """
         if not preview_file_id:
             return None
@@ -1515,9 +1641,11 @@ class KitsuReviewModel:
     # ------------------------------------------------------------------
 
     def _load_task_statuses(self):
-        """Fetch the studio's task status catalog. On failure the previous
-        catalog (if any) is kept, and comments fall back to whatever status
-        info the server embeds in them."""
+        """
+        Fetch the task status catalog of the studio. If the fetch fails, keep
+        the previous catalog (if any). Comments then use the status information
+        that the server embeds in them.
+        """
         try:
             statuses = gazu.task.all_task_statuses() or []
         except Exception as exc:
@@ -1526,8 +1654,10 @@ class KitsuReviewModel:
         self._task_statuses = {s["id"]: s for s in statuses if s.get("id")}
 
     def _load_task_types(self):
-        """Fetch the task type catalog (playlists name theirs by id). On
-        failure the previous catalog is kept."""
+        """
+        Fetch the task type catalog (playlists name their type by id). If the
+        fetch fails, keep the previous catalog.
+        """
         try:
             task_types = gazu.task.all_task_types() or []
         except Exception as exc:
@@ -1539,16 +1669,21 @@ class KitsuReviewModel:
         return self._task_statuses.get(status_id) if status_id else None
 
     def comment_status(self, comment):
-        """Status a comment was posted with. Prefers the catalog entry (it
-        has the color); falls back to the status Kitsu embeds in comments."""
+        """
+        Return the status that a comment was posted with. Prefer the catalog
+        entry, because it has the color. If there is none, use the status that
+        Kitsu embeds in comments.
+        """
         embedded = comment.get("task_status")
         embedded = embedded if isinstance(embedded, dict) else None
         status_id = comment.get("task_status_id") or (embedded or {}).get("id")
         return self.status_for_id(status_id) or embedded
 
     def _project(self, project_id):
-        """The Kitsu project (production) record, fetched once per refresh,
-        or None if it couldn't be fetched."""
+        """
+        Return the Kitsu project (production) record, fetched once for each
+        refresh. Return None if it could not be fetched.
+        """
         if not project_id:
             return None
         if project_id not in self._project_cache:
@@ -1561,14 +1696,18 @@ class KitsuReviewModel:
         return self._project_cache[project_id]
 
     def _project_status_ids(self, project_id):
-        """Ids of the statuses a project is set up to use, or None when the
-        project doesn't restrict them (or couldn't be fetched)."""
+        """
+        Return the ids of the statuses that a project is set up to use. Return
+        None if the project does not restrict them (or could not be fetched).
+        """
         raw = (self._project(project_id) or {}).get("task_statuses") or []
         return {s.get("id") if isinstance(s, dict) else s for s in raw} or None
 
     def project_fps(self, project_id):
-        """(fps, from_project): the production's frame rate as set in
-        Kitsu, or (DEFAULT_FPS, False) when it's missing or unusable."""
+        """
+        Return (fps, from_project): the frame rate of the production as set in
+        Kitsu. If it is missing or not usable, return (DEFAULT_FPS, False).
+        """
         project = self._project(project_id) or {}
         fps = _parse_fps(project.get("fps"))
         if fps is None:
@@ -1581,8 +1720,10 @@ class KitsuReviewModel:
         return fps, True
 
     def selectable_statuses(self, task):
-        """Statuses the current user can put on a comment for `task`, with
-        the task's current status always included."""
+        """
+        Return the statuses that the current user can put on a comment for
+        `task`. The current status of the task is always included.
+        """
         role = (self.current_user or {}).get("role") or ""
         project_ids = self._project_status_ids(task.get("project_id"))
         current_id = task.get("task_status_id")
@@ -1616,10 +1757,12 @@ class KitsuReviewModel:
         return result
 
     def _apply_task_status(self, task_id, status_id):
-        """Reflect a status change made by a new comment locally, on every
-        listed revision of that task (the same task can be in My Checks and
-        in several playlists), so they match the server without a reload.
-        Loaded playlists' pending counts are recounted."""
+        """
+        Copy a status change from a new comment to the local data, on every
+        listed revision of that task. The same task can be in My Checks and in
+        several playlists. Then the revisions match the server without a
+        reload. Recount the pending counts of the loaded playlists.
+        """
         status = self.status_for_id(status_id)
         touched_playlists = set()
         for rev in self.all_loaded_revisions():
@@ -1642,8 +1785,11 @@ class KitsuReviewModel:
     # ------------------------------------------------------------------
 
     def load_comments(self, task):
-        """Comment history for a task, oldest first, as display records:
-        {"date", "author", "text", "status"}. Raises if Kitsu can't be read."""
+        """
+        Return the comment history of a task, oldest first, as display records:
+        {"date", "author", "text", "status"}. Raise an error if Kitsu cannot be
+        read.
+        """
         comments = gazu.task.all_comments_for_task(task) or []
         return [
             {
@@ -1656,9 +1802,11 @@ class KitsuReviewModel:
         ]
 
     def add_comment(self, rev, text, status_id):
-        """Post a comment on the revision's task with the given status.
-        Kitsu sets the task's status to the comment's. Returns True if the
-        task's status changed (the revision is updated locally)."""
+        """
+        Post a comment with the given status on the task of the revision. Kitsu
+        sets the status of the task to the status of the comment. Return True
+        if the status of the task changed (the revision is updated locally).
+        """
         task = rev["task"]
         task_status = self.status_for_id(
             status_id
@@ -1682,8 +1830,11 @@ class KitsuReviewModel:
     def download_preview(
         self, rev, on_progress: Optional[Callable[[int], None]] = None
     ):
-        """Download the revision's preview file; returns the local path.
-        on_progress receives a 0-100 percentage. Raises on failure."""
+        """
+        Download the preview file of the revision and return the local path.
+        `on_progress` receives a percentage from 0 to 100. Raise an error on
+        failure.
+        """
         preview_file = rev["preview_file"]
 
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -1710,20 +1861,22 @@ class KitsuReviewModel:
                 preview_file, file_path, progress_callback=_progress_callback
             )
         except TypeError:
-            # Older gazu without progress_callback support.
+            # Older gazu versions do not support `progress_callback`.
             gazu.files.download_preview_file(preview_file, file_path)
         return file_path
 
     def load_into_rv(self, rev, file_path):
-        """Add a downloaded preview to the RV session and re-apply the
-        annotations Kitsu already has for it. Returns True if those
-        annotations had to be skipped because the size is unknown."""
+        """
+        Add a downloaded preview to the RV session. Apply again the annotations
+        that Kitsu already has for it. Return True if those annotations were
+        skipped because the size is unknown.
+        """
         preview_file = rev["preview_file"]
         fps = rev.get("fps") or DEFAULT_FPS
         source_node = self.rv.add_source(file_path)
         self.rv.set_fps(fps, source_node)
-        # Export reads the paint nodes of this source only (see
-        # RvSession.paint_nodes_for_source).
+        # Export reads only the paint nodes of this source (see
+        # `RvSession.paint_nodes_for_source`).
         rev["source_group"] = None
         if source_node:
             try:
@@ -1776,8 +1929,10 @@ class KitsuReviewModel:
     # ------------------------------------------------------------------
 
     def resolve_dimensions(self, rev):
-        """Pixel size for a revision, cached on the revision dict.
-        Raises DimensionsUnknownError if it can't be determined."""
+        """
+        Return the pixel size for a revision, cached on the revision dict.
+        Raise `DimensionsUnknownError` if it cannot be found.
+        """
         width, height = rev.get("width"), rev.get("height")
         if not (width and height):
             width, height = _preview_dimensions(
@@ -1787,9 +1942,11 @@ class KitsuReviewModel:
         return width, height
 
     def kitsu_records_for(self, rev, annotations):
-        """Convert gathered RV annotations into the Kitsu records that
-        Export would send for `rev`. Raises DimensionsUnknownError if the
-        revision's pixel dimensions are unknown."""
+        """
+        Convert the gathered RV annotations to the Kitsu records that Export
+        sends for `rev`. Raise `DimensionsUnknownError` if the pixel dimensions
+        of the revision are unknown.
+        """
         preview_file = rev["preview_file"]
         width, height = self.resolve_dimensions(rev)
 
@@ -1809,22 +1966,28 @@ class KitsuReviewModel:
         )
 
     def export_paint_nodes(self, rev):
-        """The paint nodes Export reads for `rev`: the ones drawing on the
-        source it was loaded into, upstream first. None (every paint node
-        in the session, in pipeline order) if that source isn't known."""
+        """
+        Return the paint nodes that Export reads for `rev`: the nodes that draw
+        on the source where the revision was loaded, upstream first. Return
+        None if that source is not known or has no paint node. Then Export
+        reads every paint node in the session, in pipeline order.
+        """
         source_group = rev.get("source_group")
         if not source_group:
             return None
         return self.rv.paint_nodes_for_source(source_group) or None
 
     def export_annotations(self, rev, fallback_comment_count=0):
-        """Send every paint node's annotations to the revision's preview
-        file on Kitsu: new objects as additions, existing ones that changed
-        (e.g. erased in RV) as updates, since Kitsu ignores an addition
-        whose id it already has. Returns {"n_comments", "frames_note"} for
-        the summary. Raises
-        DimensionsUnknownError if the size is unknown, or the server's
-        error if the push fails."""
+        """
+        Send the annotations of the paint nodes that `export_paint_nodes`
+        returns to the preview file of the revision on Kitsu. New objects go as
+        additions. Existing objects that changed (for example erased in RV) go
+        as updates, because Kitsu ignores an addition whose id it already has.
+
+        Return {"n_comments", "frames_note"} for the summary. Raise
+        `DimensionsUnknownError` if the size is unknown. Raise the error of the
+        server if the push fails.
+        """
         try:
             n_comments = len(
                 gazu.task.all_comments_for_task(rev["task"]) or []
@@ -1855,8 +2018,8 @@ class KitsuReviewModel:
                 updates=updates,
                 deletions=[],
             )
-            # Match the next export against what Kitsu now stores, not
-            # against what it had when the revision list was loaded.
+            # Compare the next export with the data that Kitsu stores now, not
+            # with the data from the load of the revision list.
             if isinstance(result, dict) and isinstance(
                 result.get("annotations"), list
             ):
@@ -1890,7 +2053,9 @@ class KitsuReviewModel:
         }
 
     def build_dev_view(self, view, current_source_only=True):
-        """(json_text, status_text) for one of the DevView views."""
+        """
+        Return (json_text, status_text) for one of the `DevView` views.
+        """
         try:
             payload, status = self._dev_payload(view, current_source_only)
         except Exception as exc:
@@ -1912,7 +2077,7 @@ class KitsuReviewModel:
                 "paint_nodes": paint_nodes,
             }
         else:
-            # What Export reads for the selected revision.
+            # The nodes that Export reads for the selected revision.
             rev = self.current_revision
             paint_nodes = self.export_paint_nodes(rev) if rev else None
             scope = (

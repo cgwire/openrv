@@ -1,6 +1,7 @@
 """
-Load the annotations of the WFA (Waiting For Approval) task(s) of a shot
-from Kitsu and store them in test_video.json.
+Load the annotations of the WFA (Waiting For Approval) tasks of a shot
+from Kitsu.
+Store the annotations in test_video.json.
 
 Requires: pip install gazu
 """
@@ -21,7 +22,9 @@ OUTPUT_FILE = "test_video.json"
 
 
 def get_wfa_status():
-    """Return the task status whose short name is WFA (case-insensitive)."""
+    """
+    Return the task status that has the short name WFA (case-insensitive).
+    """
     for status in gazu.task.all_task_statuses():
         if status["short_name"].lower() == "wfa":
             return status
@@ -29,7 +32,9 @@ def get_wfa_status():
 
 
 def get_task_annotations(task):
-    """Collect annotations from every preview attached to the task's comments."""
+    """
+    Get the annotations of each preview in the comments of the task.
+    """
     previews = []
     for comment in gazu.task.all_comments_for_task(task):
         for preview in comment.get("previews", []):
