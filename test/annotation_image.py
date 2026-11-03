@@ -45,7 +45,9 @@ def main():
         if t["task_status_id"] == wfa_status["id"]
     ]
     if not wfa_tasks:
-        sys.exit(f"No task with status {wfa_status['name']} for shot {shot['name']}.")
+        sys.exit(
+            f"No task with status {wfa_status['name']} for shot {shot['name']}."
+        )
 
     if len(wfa_tasks) > 1:
         # Several tasks waiting for approval: take the most recently updated one.
@@ -61,7 +63,9 @@ def main():
     previews = []
     for comment in gazu.task.all_comments_for_task(task):
         for preview in comment.get("previews", []):
-            preview_id = preview["id"] if isinstance(preview, dict) else preview
+            preview_id = (
+                preview["id"] if isinstance(preview, dict) else preview
+            )
             preview_file = gazu.files.get_preview_file(preview_id)
             annotations = preview_file.get("annotations") or []
             if not annotations:
@@ -90,7 +94,9 @@ def main():
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-    print(f"Saved annotations from {len(previews)} preview(s) to {OUTPUT_FILE}")
+    print(
+        f"Saved annotations from {len(previews)} preview(s) to {OUTPUT_FILE}"
+    )
     gazu.log_out()
 
 

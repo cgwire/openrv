@@ -18,15 +18,18 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
 from annotation_converter import (
-    DEFAULT_FPS, convertToKitsu, convertToORV, split_annotation_changes,
+    DEFAULT_FPS,
+    convertToKitsu,
+    convertToORV,
+    split_annotation_changes,
 )
 
 try:
-    from PySide6 import QtCore, QtGui
-    import requests
-    import rv.commands as rvc
     import gazu
     import gazu.exception
+    import requests
+    import rv.commands as rvc
+    from PySide6 import QtCore, QtGui
 
     _INSIDE_OPENRV = True
 except ImportError:
@@ -57,8 +60,17 @@ _FRAME_ORDER_RE = re.compile(r"\bframe:(\d+)\b.*\.order$")
 _RESOLUTION_RE = re.compile(r"^\s*(\d+)\s*[xX*]\s*(\d+)\s*$")
 
 _STILL_EXTENSIONS = {
-    "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff",
-    "exr", "dpx", "tga", "webp",
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "bmp",
+    "tif",
+    "tiff",
+    "exr",
+    "dpx",
+    "tga",
+    "webp",
 }
 
 # Kitsu roles whose comments are limited to statuses flagged
@@ -76,9 +88,10 @@ _PLAYLIST_MAX_PAGES = 50
 
 class DevView:
     """Keys for the Dev tab's views (the view maps them to labels)."""
-    RV = "rv"                # raw OpenRV paint properties
+
+    RV = "rv"  # raw OpenRV paint properties
     CONVERTED = "converted"  # converted to Kitsu format (export preview)
-    SERVER = "server"        # stored on Kitsu for the selected revision
+    SERVER = "server"  # stored on Kitsu for the selected revision
 
 
 class SessionRejected(Exception):
@@ -93,6 +106,7 @@ class DimensionsUnknownError(ValueError):
 # Small helpers
 # ----------------------------------------------------------------------
 
+
 def _preview_revision(preview_file):
     """Best-effort revision number for a gazu preview file dict."""
     return preview_file.get("revision", 0) or 0
@@ -103,7 +117,9 @@ def _format_date(value):
     if not value:
         return "-"
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M")
+        return datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        ).strftime("%Y-%m-%d %H:%M")
     except (ValueError, AttributeError):
         return str(value)
 
@@ -171,7 +187,10 @@ def _is_still(preview_file):
 
     Kitsu records "extension" without a leading dot.
     """
-    return str(preview_file.get("extension") or "").lower().lstrip(".") in _STILL_EXTENSIONS
+    return (
+        str(preview_file.get("extension") or "").lower().lstrip(".")
+        in _STILL_EXTENSIONS
+    )
 
 
 def _normalize_full_task(task):
@@ -199,7 +218,9 @@ def _entity_label(task, entity):
     """Shot label as Kitsu shows it in playlists, e.g. "SQ010 / SH0040"."""
     name = (entity or {}).get("name") or task.get("entity_name") or "Unknown"
     sequence = task.get("sequence")
-    sequence_name = sequence.get("name") if isinstance(sequence, dict) else None
+    sequence_name = (
+        sequence.get("name") if isinstance(sequence, dict) else None
+    )
     return f"{sequence_name} / {name}" if sequence_name else name
 
 
@@ -216,12 +237,18 @@ def _auth_error_types():
     opposed to "the server couldn't be reached". Looked up by name since
     the set differs slightly between gazu versions. KeyError covers a
     refresh response that came back without a new access token."""
-    names = ("NotAuthenticatedException", "NotAllowedException", "ParameterException")
+    names = (
+        "NotAuthenticatedException",
+        "NotAllowedException",
+        "ParameterException",
+    )
     found = tuple(
-        exc_type for exc_type in (getattr(gazu.exception, n, None) for n in names)
+        exc_type
+        for exc_type in (getattr(gazu.exception, n, None) for n in names)
         if isinstance(exc_type, type)
     )
     return found + (KeyError,)
+
 
 def _current_gazu_tokens():
     """The gazu client's current session tokens as a plain dict.
@@ -236,14 +263,17 @@ def _current_gazu_tokens():
         return dict(tokens)
 
     result = {}
-    for kind, getter_name in (("access_token", "get_access_token"),
-                              ("refresh_token", "get_refresh_token")):
+    for kind, getter_name in (
+        ("access_token", "get_access_token"),
+        ("refresh_token", "get_refresh_token"),
+    ):
         getter = getattr(gazu.client, getter_name, None)
         if callable(getter):
             value = getter()
             if value:
                 result[kind] = value
     return result
+
 
 def _dimensions_from_file(file_path):
     """Read pixel dimensions off a downloaded file, or None if that isn't
@@ -273,7 +303,9 @@ def _preview_dimensions(preview_file, entity=None, file_path=None):
 
     for record in preview_file.get("annotations") or []:
         for obj in record.get("drawing", {}).get("objects", []):
-            canvas_w, canvas_h = obj.get("canvasWidth"), obj.get("canvasHeight")
+            canvas_w, canvas_h = obj.get("canvasWidth"), obj.get(
+                "canvasHeight"
+            )
             if canvas_w and canvas_h:
                 return int(round(float(canvas_w))), int(round(float(canvas_h)))
 
@@ -287,6 +319,7 @@ def _preview_dimensions(preview_file, entity=None, file_path=None):
 # ----------------------------------------------------------------------
 # Session persistence
 # ----------------------------------------------------------------------
+
 
 class _SessionStore:
     """Persists login details between OpenRV sessions.
@@ -350,10 +383,14 @@ class _SessionStore:
         tokens = {}
         for kind in _TOKEN_KINDS:
             try:
-                value = keyring.get_password(KEYRING_SERVICE, self._account(server, email, kind))
+                value = keyring.get_password(
+                    KEYRING_SERVICE, self._account(server, email, kind)
+                )
             except Exception as exc:
-                print(f"[KitsuReview] Could not read the saved session from the "
-                      f"credential store: {exc}")
+                print(
+                    f"[KitsuReview] Could not read the saved session from the "
+                    f"credential store: {exc}"
+                )
                 return None
             if value:
                 tokens[kind] = value
@@ -371,7 +408,9 @@ class _SessionStore:
                 else:
                     self._delete(account)
         except Exception as exc:
-            print(f"[KitsuReview] Could not save the session to the credential store: {exc}")
+            print(
+                f"[KitsuReview] Could not save the session to the credential store: {exc}"
+            )
             return False
         return True
 
@@ -382,12 +421,15 @@ class _SessionStore:
             try:
                 self._delete(self._account(server, email, kind))
             except Exception as exc:
-                print(f"[KitsuReview] Could not remove a saved session entry: {exc}")
+                print(
+                    f"[KitsuReview] Could not remove a saved session entry: {exc}"
+                )
 
 
 # ----------------------------------------------------------------------
 # RV session (sources, frames, paint nodes)
 # ----------------------------------------------------------------------
+
 
 class RvSession:
     """Reads and writes the open RV session: sources, frame ranges and
@@ -435,7 +477,9 @@ class RvSession:
         try:
             rvc.setFPS(float(fps))
         except Exception as exc:
-            print(f"[KitsuReview] Could not set RV playback FPS to {fps}: {exc}")
+            print(
+                f"[KitsuReview] Could not set RV playback FPS to {fps}: {exc}"
+            )
             return False
         return True
 
@@ -451,7 +495,9 @@ class RvSession:
         try:
             info = rvc.nodeRangeInfo(source_node) or {}
         except Exception as exc:
-            print(f"[KitsuReview] Could not query frame range for {source_node}: {exc}")
+            print(
+                f"[KitsuReview] Could not query frame range for {source_node}: {exc}"
+            )
             return default
         start = info.get("start") if isinstance(info, dict) else None
         try:
@@ -499,11 +545,13 @@ class RvSession:
         """Paint nodes with those inside source groups first: they're
         upstream of any view-level paint node, so RV draws their strokes
         first (see `paint_nodes_for_source`)."""
+
         def is_view_level(node):
             try:
                 return rvc.nodeType(rvc.nodeGroup(node)) != "RVSourceGroup"
             except Exception:
                 return True
+
         return sorted(paint_nodes, key=is_view_level)
 
     def current_source_paint_nodes(self):
@@ -516,7 +564,9 @@ class RvSession:
         try:
             sources = list(rvc.sourcesAtFrame(rvc.frame()) or [])
         except Exception as exc:
-            print(f"[KitsuReview] Could not query sources at current frame: {exc}")
+            print(
+                f"[KitsuReview] Could not query sources at current frame: {exc}"
+            )
             return [], []
 
         paint_nodes: List[str] = []
@@ -524,7 +574,9 @@ class RvSession:
             try:
                 group = rvc.nodeGroup(source)
             except Exception as exc:
-                print(f"[KitsuReview] Could not inspect group of {source}: {exc}")
+                print(
+                    f"[KitsuReview] Could not inspect group of {source}: {exc}"
+                )
                 continue
             for node in self.paint_nodes_for_source(group):
                 if node not in paint_nodes:
@@ -560,39 +612,92 @@ class RvSession:
         if len(width) != len(points):
             width = [width[0]] * len(points)
 
-        self._set_prop(f"{base}.color", rvc.FloatType, 4, self._color_float(props.get("color")))
+        self._set_prop(
+            f"{base}.color",
+            rvc.FloatType,
+            4,
+            self._color_float(props.get("color")),
+        )
         self._set_prop(f"{base}.width", rvc.FloatType, 1, width)
         self._set_prop(f"{base}.brush", rvc.StringType, 1, ["circle"])
-        self._set_prop(f"{base}.points", rvc.FloatType, 2,
-                       [c for xy in points for c in xy])
+        self._set_prop(
+            f"{base}.points",
+            rvc.FloatType,
+            2,
+            [c for xy in points for c in xy],
+        )
         self._set_prop(f"{base}.debug", rvc.IntType, 1, [0])
         self._set_prop(f"{base}.join", rvc.IntType, 1, [3])
         self._set_prop(f"{base}.cap", rvc.IntType, 1, [1])
         self._set_prop(f"{base}.splat", rvc.IntType, 1, [0])
         # 0 paints, 1 erases what's drawn before it (Kitsu erasers).
-        self._set_prop(f"{base}.mode", rvc.IntType, 1, [int(props.get("mode") or 0)])
+        self._set_prop(
+            f"{base}.mode", rvc.IntType, 1, [int(props.get("mode") or 0)]
+        )
         if props.get("uuid"):
-            self._set_prop(f"{base}.uuid", rvc.StringType, 1, [str(props["uuid"])])
+            self._set_prop(
+                f"{base}.uuid", rvc.StringType, 1, [str(props["uuid"])]
+            )
 
     def _write_box(self, base, frame, props):
         """The same properties RV writes for an ellipse or rect drawn with
         its own annotate tools (see a gathered RV shape in the Dev tab);
         the two share one property set and differ only in the component
         name's "ellipse:"/"rect:" prefix."""
-        self._set_prop(f"{base}.startFrame", rvc.IntType, 1, [int(props.get("startFrame", frame))])
-        self._set_prop(f"{base}.duration", rvc.IntType, 1, [int(props.get("duration", 1))])
-        self._set_prop(f"{base}.eye", rvc.IntType, 1, [int(props.get("eye", 2))])
-        self._set_prop(f"{base}.min", rvc.FloatType, 2, [float(v) for v in props["min"][0]])
-        self._set_prop(f"{base}.max", rvc.FloatType, 2, [float(v) for v in props["max"][0]])
-        self._set_prop(f"{base}.innerColor", rvc.FloatType, 4,
-                       self._color_float(props.get("innerColor"), default=(255, 255, 255, 0)))
-        self._set_prop(f"{base}.borderColor", rvc.FloatType, 4,
-                       self._color_float(props.get("borderColor")))
-        self._set_prop(f"{base}.borderWidth", rvc.FloatType, 1,
-                       [float(props.get("borderWidth", 0.003))])
+        self._set_prop(
+            f"{base}.startFrame",
+            rvc.IntType,
+            1,
+            [int(props.get("startFrame", frame))],
+        )
+        self._set_prop(
+            f"{base}.duration", rvc.IntType, 1, [int(props.get("duration", 1))]
+        )
+        self._set_prop(
+            f"{base}.eye", rvc.IntType, 1, [int(props.get("eye", 2))]
+        )
+        self._set_prop(
+            f"{base}.min",
+            rvc.FloatType,
+            2,
+            [float(v) for v in props["min"][0]],
+        )
+        self._set_prop(
+            f"{base}.max",
+            rvc.FloatType,
+            2,
+            [float(v) for v in props["max"][0]],
+        )
+        self._set_prop(
+            f"{base}.innerColor",
+            rvc.FloatType,
+            4,
+            self._color_float(
+                props.get("innerColor"), default=(255, 255, 255, 0)
+            ),
+        )
+        self._set_prop(
+            f"{base}.borderColor",
+            rvc.FloatType,
+            4,
+            self._color_float(props.get("borderColor")),
+        )
+        self._set_prop(
+            f"{base}.borderWidth",
+            rvc.FloatType,
+            1,
+            [float(props.get("borderWidth", 0.003))],
+        )
         if props.get("uuid"):
-            self._set_prop(f"{base}.uuid", rvc.StringType, 1, [str(props["uuid"])])
-        self._set_prop(f"{base}.softDeleted", rvc.IntType, 1, [int(props.get("softDeleted", 0))])
+            self._set_prop(
+                f"{base}.uuid", rvc.StringType, 1, [str(props["uuid"])]
+            )
+        self._set_prop(
+            f"{base}.softDeleted",
+            rvc.IntType,
+            1,
+            [int(props.get("softDeleted", 0))],
+        )
 
     def _write_arrow(self, base, frame, props):
         """The same properties RV writes for an arrow drawn with its own
@@ -600,22 +705,58 @@ class RvSession:
         both thickness and borderWidth, the color in borderColor and
         innerColor."""
         border = self._color_float(props.get("borderColor"))
-        inner = self._color_float(props["innerColor"]) if props.get("innerColor") else border
-        thickness = float(props.get("thickness", props.get("borderWidth", 0.003)))
+        inner = (
+            self._color_float(props["innerColor"])
+            if props.get("innerColor")
+            else border
+        )
+        thickness = float(
+            props.get("thickness", props.get("borderWidth", 0.003))
+        )
 
-        self._set_prop(f"{base}.startFrame", rvc.IntType, 1, [int(props.get("startFrame", frame))])
-        self._set_prop(f"{base}.duration", rvc.IntType, 1, [int(props.get("duration", 1))])
-        self._set_prop(f"{base}.eye", rvc.IntType, 1, [int(props.get("eye", 2))])
-        self._set_prop(f"{base}.startPos", rvc.FloatType, 2, [float(v) for v in props["startPos"][0]])
-        self._set_prop(f"{base}.endPos", rvc.FloatType, 2, [float(v) for v in props["endPos"][0]])
+        self._set_prop(
+            f"{base}.startFrame",
+            rvc.IntType,
+            1,
+            [int(props.get("startFrame", frame))],
+        )
+        self._set_prop(
+            f"{base}.duration", rvc.IntType, 1, [int(props.get("duration", 1))]
+        )
+        self._set_prop(
+            f"{base}.eye", rvc.IntType, 1, [int(props.get("eye", 2))]
+        )
+        self._set_prop(
+            f"{base}.startPos",
+            rvc.FloatType,
+            2,
+            [float(v) for v in props["startPos"][0]],
+        )
+        self._set_prop(
+            f"{base}.endPos",
+            rvc.FloatType,
+            2,
+            [float(v) for v in props["endPos"][0]],
+        )
         self._set_prop(f"{base}.borderColor", rvc.FloatType, 4, border)
-        self._set_prop(f"{base}.borderWidth", rvc.FloatType, 1,
-                       [float(props.get("borderWidth", thickness))])
+        self._set_prop(
+            f"{base}.borderWidth",
+            rvc.FloatType,
+            1,
+            [float(props.get("borderWidth", thickness))],
+        )
         self._set_prop(f"{base}.innerColor", rvc.FloatType, 4, inner)
         self._set_prop(f"{base}.thickness", rvc.FloatType, 1, [thickness])
         if props.get("uuid"):
-            self._set_prop(f"{base}.uuid", rvc.StringType, 1, [str(props["uuid"])])
-        self._set_prop(f"{base}.softDeleted", rvc.IntType, 1, [int(props.get("softDeleted", 0))])
+            self._set_prop(
+                f"{base}.uuid", rvc.StringType, 1, [str(props["uuid"])]
+            )
+        self._set_prop(
+            f"{base}.softDeleted",
+            rvc.IntType,
+            1,
+            [int(props.get("softDeleted", 0))],
+        )
 
     def _write_text(self, base, frame, props):
         """The same properties RV writes for text placed with its own
@@ -630,29 +771,97 @@ class RvSession:
         font_size = float(props.get("fontSize", 0.05))
         size = float(props.get("size", font_size / scale / 12.5))
 
-        self._set_prop(f"{base}.position", rvc.FloatType, 2, [float(v) for v in position[:2]])
-        self._set_prop(f"{base}.color", rvc.FloatType, 4, self._color_float(props.get("color")))
-        self._set_prop(f"{base}.spacing", rvc.FloatType, 1, [float(props.get("spacing", 0.8))])
+        self._set_prop(
+            f"{base}.position",
+            rvc.FloatType,
+            2,
+            [float(v) for v in position[:2]],
+        )
+        self._set_prop(
+            f"{base}.color",
+            rvc.FloatType,
+            4,
+            self._color_float(props.get("color")),
+        )
+        self._set_prop(
+            f"{base}.spacing",
+            rvc.FloatType,
+            1,
+            [float(props.get("spacing", 0.8))],
+        )
         self._set_prop(f"{base}.size", rvc.FloatType, 1, [size])
         self._set_prop(f"{base}.scale", rvc.FloatType, 1, [scale])
-        self._set_prop(f"{base}.rotation", rvc.FloatType, 1, [float(props.get("rotation", 0.0))])
-        self._set_prop(f"{base}.font", rvc.StringType, 1, [str(props.get("font", ""))])
-        self._set_prop(f"{base}.text", rvc.StringType, 1, [str(props.get("text", ""))])
-        self._set_prop(f"{base}.origin", rvc.StringType, 1, [str(props.get("origin", ""))])
-        self._set_prop(f"{base}.debug", rvc.IntType, 1, [int(props.get("debug", 0))])
-        self._set_prop(f"{base}.startFrame", rvc.IntType, 1, [int(props.get("startFrame", frame))])
-        self._set_prop(f"{base}.duration", rvc.IntType, 1, [int(props.get("duration", 1))])
-        self._set_prop(f"{base}.mode", rvc.IntType, 1, [int(props.get("mode", 0))])
-        self._set_prop(f"{base}.fontFamily", rvc.StringType, 1, [str(props.get("fontFamily", ""))])
+        self._set_prop(
+            f"{base}.rotation",
+            rvc.FloatType,
+            1,
+            [float(props.get("rotation", 0.0))],
+        )
+        self._set_prop(
+            f"{base}.font", rvc.StringType, 1, [str(props.get("font", ""))]
+        )
+        self._set_prop(
+            f"{base}.text", rvc.StringType, 1, [str(props.get("text", ""))]
+        )
+        self._set_prop(
+            f"{base}.origin", rvc.StringType, 1, [str(props.get("origin", ""))]
+        )
+        self._set_prop(
+            f"{base}.debug", rvc.IntType, 1, [int(props.get("debug", 0))]
+        )
+        self._set_prop(
+            f"{base}.startFrame",
+            rvc.IntType,
+            1,
+            [int(props.get("startFrame", frame))],
+        )
+        self._set_prop(
+            f"{base}.duration", rvc.IntType, 1, [int(props.get("duration", 1))]
+        )
+        self._set_prop(
+            f"{base}.mode", rvc.IntType, 1, [int(props.get("mode", 0))]
+        )
+        self._set_prop(
+            f"{base}.fontFamily",
+            rvc.StringType,
+            1,
+            [str(props.get("fontFamily", ""))],
+        )
         self._set_prop(f"{base}.fontSize", rvc.FloatType, 1, [font_size])
-        self._set_prop(f"{base}.fontWeight", rvc.StringType, 1, [str(props.get("fontWeight", "normal"))])
-        self._set_prop(f"{base}.fontStyle", rvc.StringType, 1, [str(props.get("fontStyle", "normal"))])
-        self._set_prop(f"{base}.textDecoration", rvc.StringType, 1,
-                       [str(props.get("textDecoration", "none"))])
-        self._set_prop(f"{base}.textAlign", rvc.StringType, 1, [str(props.get("textAlign", "left"))])
+        self._set_prop(
+            f"{base}.fontWeight",
+            rvc.StringType,
+            1,
+            [str(props.get("fontWeight", "normal"))],
+        )
+        self._set_prop(
+            f"{base}.fontStyle",
+            rvc.StringType,
+            1,
+            [str(props.get("fontStyle", "normal"))],
+        )
+        self._set_prop(
+            f"{base}.textDecoration",
+            rvc.StringType,
+            1,
+            [str(props.get("textDecoration", "none"))],
+        )
+        self._set_prop(
+            f"{base}.textAlign",
+            rvc.StringType,
+            1,
+            [str(props.get("textAlign", "left"))],
+        )
         if props.get("uuid"):
-            self._set_prop(f"{base}.uuid", rvc.StringType, 1, [str(props["uuid"])])
-        self._set_prop(f"{base}.softDeleted", rvc.IntType, 1, [int(props.get("softDeleted", 0))])
+            self._set_prop(
+                f"{base}.uuid", rvc.StringType, 1, [str(props["uuid"])]
+            )
+        self._set_prop(
+            f"{base}.softDeleted",
+            rvc.IntType,
+            1,
+            [int(props.get("softDeleted", 0))],
+        )
 
     _SHAPE_WRITERS = {
         "pen": "_write_pen",
@@ -674,19 +883,26 @@ class RvSession:
             kind = shape.get("type")
             writer = self._SHAPE_WRITERS.get(kind)
             if writer is None:
-                print(f"[KitsuReview] Live-apply: skipping unsupported shape "
-                      f"type {kind!r}", file=sys.stderr)
+                print(
+                    f"[KitsuReview] Live-apply: skipping unsupported shape "
+                    f"type {kind!r}",
+                    file=sys.stderr,
+                )
                 continue
 
             frame = int(shape["frame"])
             cname = f"{kind}:{next_id}:{frame}:Kitsu"
-            getattr(self, writer)(f"{paint_node}.{cname}", frame, shape["properties"])
+            getattr(self, writer)(
+                f"{paint_node}.{cname}", frame, shape["properties"]
+            )
 
             frame_order.setdefault(frame, []).append(cname)
             next_id += 1
 
         for frame, names in frame_order.items():
-            self._set_prop(f"{paint_node}.frame:{frame}.order", rvc.StringType, 1, names)
+            self._set_prop(
+                f"{paint_node}.frame:{frame}.order", rvc.StringType, 1, names
+            )
 
         rvc.redraw()
 
@@ -697,7 +913,11 @@ class RvSession:
         except Exception:
             return None
 
-        ptype = info.get("type") if isinstance(info, dict) else getattr(info, "type", None)
+        ptype = (
+            info.get("type")
+            if isinstance(info, dict)
+            else getattr(info, "type", None)
+        )
 
         if ptype == rvc.FloatType:
             return rvc.getFloatProperty(prop)
@@ -723,7 +943,9 @@ class RvSession:
 
         if paint_nodes is None:
             try:
-                paint_nodes = self._pipeline_order(rvc.nodesOfType("RVPaint") or [])
+                paint_nodes = self._pipeline_order(
+                    rvc.nodesOfType("RVPaint") or []
+                )
             except Exception as exc:
                 print(f"[KitsuReview] Could not query paint nodes: {exc}")
                 return annotations
@@ -752,31 +974,45 @@ class RvSession:
                     continue
 
                 for item_name in order:
-                    kind = item_name.split(":")[0] if ":" in item_name else item_name
+                    kind = (
+                        item_name.split(":")[0]
+                        if ":" in item_name
+                        else item_name
+                    )
                     item_prefix = f"{node}.{item_name}."
 
                     properties = {}
                     for p in all_props:
                         if not p.startswith(item_prefix):
                             continue
-                        attr = p[len(item_prefix):]
+                        attr = p[len(item_prefix) :]
                         value = self._property_value(p)
 
                         group_size = self._GROUPED_KEYS.get(attr)
-                        if group_size and isinstance(value, list) and len(value) % group_size == 0 and len(value) > 0:
-                            value = [list(value[i:i + group_size]) for i in range(0, len(value), group_size)]
+                        if (
+                            group_size
+                            and isinstance(value, list)
+                            and len(value) % group_size == 0
+                            and len(value) > 0
+                        ):
+                            value = [
+                                list(value[i : i + group_size])
+                                for i in range(0, len(value), group_size)
+                            ]
                         elif isinstance(value, list) and len(value) == 1:
                             value = value[0]
 
                         properties[attr] = value
 
-                    annotations.append({
-                        "frame": frame,
-                        "node": node,
-                        "name": item_name,
-                        "type": kind,
-                        "properties": properties,
-                    })
+                    annotations.append(
+                        {
+                            "frame": frame,
+                            "node": node,
+                            "name": item_name,
+                            "type": kind,
+                            "properties": properties,
+                        }
+                    )
 
         annotations.sort(key=lambda a: a["frame"])
 
@@ -786,6 +1022,7 @@ class RvSession:
 # ----------------------------------------------------------------------
 # The model
 # ----------------------------------------------------------------------
+
 
 class KitsuReviewModel:
     """State and operations behind the Kitsu Review panel.
@@ -822,7 +1059,9 @@ class KitsuReviewModel:
         self._session_email = None
         self._saved_tokens = None
 
-        self.remember = self.store.secure_available() and self.store.remember_enabled()
+        self.remember = (
+            self.store.secure_available() and self.store.remember_enabled()
+        )
 
     # ------------------------------------------------------------------
     # Login / session persistence
@@ -837,7 +1076,11 @@ class KitsuReviewModel:
 
     def display_name(self):
         """Best-effort display name from the gazu user dict."""
-        return person_display_name(self.current_user) if self.current_user else "Unknown user"
+        return (
+            person_display_name(self.current_user)
+            if self.current_user
+            else "Unknown user"
+        )
 
     def authenticate(self, server, email, password):
         """Exchange a password for a Kitsu session; returns the user."""
@@ -872,7 +1115,9 @@ class KitsuReviewModel:
         try:
             gazu.log_out()
         except Exception as exc:
-            print(f"[KitsuReview] gazu.log_out() failed (continuing anyway): {exc}")
+            print(
+                f"[KitsuReview] gazu.log_out() failed (continuing anyway): {exc}"
+            )
         self.logged_in = False
         self.current_user = None
         self._session_server = self._session_email = None
@@ -918,10 +1163,14 @@ class KitsuReviewModel:
         try:
             tokens = _current_gazu_tokens()
         except Exception as exc:
-            print(f"[KitsuReview] Could not read the current gazu session tokens: {exc}")
+            print(
+                f"[KitsuReview] Could not read the current gazu session tokens: {exc}"
+            )
             return
         # Keep only what we store, so the "unchanged?" check is stable.
-        tokens = {k: str(v) for k, v in tokens.items() if k in _TOKEN_KINDS and v}
+        tokens = {
+            k: str(v) for k, v in tokens.items() if k in _TOKEN_KINDS and v
+        }
         if not tokens.get("access_token"):
             return  # nothing usable to save yet
 
@@ -929,14 +1178,21 @@ class KitsuReviewModel:
         # only holds the new access token. Keep the refresh token we already
         # have; otherwise save_tokens() would delete it from the store.
         if not tokens.get("refresh_token"):
-            previous = self._saved_tokens or self.store.load_tokens(
-                self._session_server, self._session_email) or {}
+            previous = (
+                self._saved_tokens
+                or self.store.load_tokens(
+                    self._session_server, self._session_email
+                )
+                or {}
+            )
             if previous.get("refresh_token"):
                 tokens["refresh_token"] = previous["refresh_token"]
 
         if tokens == self._saved_tokens:
             return
-        if self.store.save_tokens(self._session_server, self._session_email, tokens):
+        if self.store.save_tokens(
+            self._session_server, self._session_email, tokens
+        ):
             self._saved_tokens = tokens
 
     def set_remember(self, enabled):
@@ -990,7 +1246,9 @@ class KitsuReviewModel:
             self._reset_gazu_tokens()
             raise
         except Exception as exc:
-            print(f"[KitsuReview] Could not restore the saved Kitsu session: {exc}")
+            print(
+                f"[KitsuReview] Could not restore the saved Kitsu session: {exc}"
+            )
             self._reset_gazu_tokens()
             raise
 
@@ -1019,10 +1277,13 @@ class KitsuReviewModel:
             "task_type": task.get("task_type_name", "Unknown"),
             "revision": _preview_revision(preview_file),
             "status": task.get(
-                "task_status_name", task.get("task_status_short_name", "Unknown")
+                "task_status_name",
+                task.get("task_status_short_name", "Unknown"),
             ),
             "artist": artist,
-            "date": _format_date(preview_file.get("created_at") or task.get("updated_at")),
+            "date": _format_date(
+                preview_file.get("created_at") or task.get("updated_at")
+            ),
             "width": None,
             "height": None,
             "base_frame": 1,
@@ -1049,12 +1310,18 @@ class KitsuReviewModel:
                 try:
                     entity = gazu.entity.get_entity(entity_id) or {}
                 except Exception as exc:
-                    print(f"[KitsuReview] Could not fetch entity {entity_id}: {exc}")
+                    print(
+                        f"[KitsuReview] Could not fetch entity {entity_id}: {exc}"
+                    )
 
             try:
-                previews = gazu.files.get_all_preview_files_for_task(task) or []
+                previews = (
+                    gazu.files.get_all_preview_files_for_task(task) or []
+                )
             except Exception as exc:
-                print(f"[KitsuReview] Could not fetch previews for task {task.get('id')}: {exc}")
+                print(
+                    f"[KitsuReview] Could not fetch previews for task {task.get('id')}: {exc}"
+                )
                 previews = []
 
             if not previews:
@@ -1062,11 +1329,16 @@ class KitsuReviewModel:
 
             latest_preview = max(previews, key=_preview_revision)
             revisions.append(
-                self._make_revision(task, entity, latest_preview, self.display_name())
+                self._make_revision(
+                    task, entity, latest_preview, self.display_name()
+                )
             )
 
         self.check_revisions = revisions
-        if self.current_revision and self.current_revision.get("playlist") is None:
+        if (
+            self.current_revision
+            and self.current_revision.get("playlist") is None
+        ):
             self.current_revision = None
         return revisions
 
@@ -1089,7 +1361,8 @@ class KitsuReviewModel:
 
     def feedback_status_ids(self):
         return {
-            sid for sid, status in self._task_statuses.items()
+            sid
+            for sid, status in self._task_statuses.items()
             if status.get("is_feedback_request")
         }
 
@@ -1111,7 +1384,10 @@ class KitsuReviewModel:
         projects = gazu.user.all_open_projects() or []
         self._refresh_catalogs()
         self._playlist_revisions.clear()
-        if self.current_revision and self.current_revision.get("playlist") is not None:
+        if (
+            self.current_revision
+            and self.current_revision.get("playlist") is not None
+        ):
             self.current_revision = None
 
         feedback_ids = self.feedback_status_ids()
@@ -1122,14 +1398,17 @@ class KitsuReviewModel:
                 continue
             awaiting = (
                 self._entities_awaiting_review(project["id"], feedback_ids)
-                if feedback_ids else None
+                if feedback_ids
+                else None
             )
             for light in playlists:
                 summary = self._playlist_summary(light, project, awaiting)
                 if summary is not None:
                     summaries.append(summary)
 
-        summaries.sort(key=lambda s: str(s.get("_updated_raw") or ""), reverse=True)
+        summaries.sort(
+            key=lambda s: str(s.get("_updated_raw") or ""), reverse=True
+        )
         self.playlists = summaries
         return summaries
 
@@ -1140,15 +1419,20 @@ class KitsuReviewModel:
         seen, result = set(), []
         for page in range(1, _PLAYLIST_MAX_PAGES + 1):
             try:
-                batch = gazu.playlist.all_playlists_for_project(project, page=page) or []
+                batch = (
+                    gazu.playlist.all_playlists_for_project(project, page=page)
+                    or []
+                )
             except TypeError:
                 # Older gazu without the page argument returns everything.
                 if page > 1:
                     break
                 batch = gazu.playlist.all_playlists_for_project(project) or []
             except Exception as exc:
-                print(f"[KitsuReview] Could not fetch playlists for project "
-                      f"{project.get('name')!r}: {exc}")
+                print(
+                    f"[KitsuReview] Could not fetch playlists for project "
+                    f"{project.get('name')!r}: {exc}"
+                )
                 break
             new = [p for p in batch if p.get("id") and p["id"] not in seen]
             if not new:
@@ -1163,15 +1447,26 @@ class KitsuReviewModel:
         index: Dict[str, set] = {}
         for status_id in feedback_ids:
             try:
-                tasks = gazu.client.fetch_all(
-                    "tasks", {"project_id": project_id, "task_status_id": status_id}
-                ) or []
+                tasks = (
+                    gazu.client.fetch_all(
+                        "tasks",
+                        {
+                            "project_id": project_id,
+                            "task_status_id": status_id,
+                        },
+                    )
+                    or []
+                )
             except Exception as exc:
-                print(f"[KitsuReview] Could not fetch tasks awaiting review for "
-                      f"project {project_id}: {exc}")
+                print(
+                    f"[KitsuReview] Could not fetch tasks awaiting review for "
+                    f"project {project_id}: {exc}"
+                )
                 return None
             for task in tasks:
-                index.setdefault(task.get("entity_id"), set()).add(task.get("task_type_id"))
+                index.setdefault(task.get("entity_id"), set()).add(
+                    task.get("task_type_id")
+                )
         return index
 
     def _playlist_summary(self, light, project, awaiting):
@@ -1183,7 +1478,9 @@ class KitsuReviewModel:
             try:
                 playlist = gazu.playlist.get_playlist(light["id"]) or light
             except Exception as exc:
-                print(f"[KitsuReview] Could not fetch playlist {light.get('name')!r}: {exc}")
+                print(
+                    f"[KitsuReview] Could not fetch playlist {light.get('name')!r}: {exc}"
+                )
                 return None
             entries = playlist.get("shots") or []
         entries = [e for e in entries if isinstance(e, dict)]
@@ -1193,9 +1490,13 @@ class KitsuReviewModel:
         pending = None
         if awaiting is not None:
             pending = sum(
-                1 for e in reviewable
+                1
+                for e in reviewable
                 if (awaiting.get(e.get("entity_id")) or set())
-                and (not task_type_id or task_type_id in awaiting[e["entity_id"]])
+                and (
+                    not task_type_id
+                    or task_type_id in awaiting[e["entity_id"]]
+                )
             )
 
         updated_raw = playlist.get("updated_at") or playlist.get("created_at")
@@ -1204,7 +1505,8 @@ class KitsuReviewModel:
             "name": playlist.get("name") or "(unnamed playlist)",
             "project": project.get("name") or "?",
             "project_id": project.get("id"),
-            "task_type": (self._task_types.get(task_type_id) or {}).get("name") or "",
+            "task_type": (self._task_types.get(task_type_id) or {}).get("name")
+            or "",
             "for_client": bool(playlist.get("for_client")),
             "updated": _format_date(updated_raw),
             "_updated_raw": updated_raw,
@@ -1245,15 +1547,23 @@ class KitsuReviewModel:
             return None
         try:
             preview_file = gazu.files.get_preview_file(preview_id) or {}
-            task = _normalize_full_task(gazu.task.get_task(preview_file["task_id"]))
+            task = _normalize_full_task(
+                gazu.task.get_task(preview_file["task_id"])
+            )
         except Exception as exc:
-            print(f"[KitsuReview] Skipped playlist entry {entry.get('entity_id')} "
-                  f"(preview {preview_id}): {exc}")
+            print(
+                f"[KitsuReview] Skipped playlist entry {entry.get('entity_id')} "
+                f"(preview {preview_id}): {exc}"
+            )
             return None
 
-        entity = task.get("entity") if isinstance(task.get("entity"), dict) else {}
+        entity = (
+            task.get("entity") if isinstance(task.get("entity"), dict) else {}
+        )
         return self._make_revision(
-            task, entity, preview_file,
+            task,
+            entity,
+            preview_file,
             self._person_name(preview_file.get("person_id")),
             shot=_entity_label(task, entity),
             playlist=summary["id"],
@@ -1267,7 +1577,9 @@ class KitsuReviewModel:
             try:
                 name = person_display_name(gazu.person.get_person(person_id))
             except Exception as exc:
-                print(f"[KitsuReview] Could not fetch person {person_id}: {exc}")
+                print(
+                    f"[KitsuReview] Could not fetch person {person_id}: {exc}"
+                )
                 name = "Unknown"
             self._person_cache[person_id] = name
         return self._person_cache[person_id]
@@ -1285,7 +1597,9 @@ class KitsuReviewModel:
 
     def playlist_for_revision(self, rev):
         playlist_id = (rev or {}).get("playlist")
-        return next((s for s in self.playlists if s["id"] == playlist_id), None)
+        return next(
+            (s for s in self.playlists if s["id"] == playlist_id), None
+        )
 
     def thumbnail_bytes(self, preview_file_id):
         """Fetch (and cache) the encoded thumbnail image for a preview file.
@@ -1309,8 +1623,10 @@ class KitsuReviewModel:
             if response.ok:
                 data = response.content
         except Exception as exc:
-            print(f"[KitsuReview] Could not fetch thumbnail for preview "
-                  f"{preview_file_id}: {exc}")
+            print(
+                f"[KitsuReview] Could not fetch thumbnail for preview "
+                f"{preview_file_id}: {exc}"
+            )
 
         self._thumbnail_cache[preview_file_id] = data
         return data
@@ -1360,7 +1676,9 @@ class KitsuReviewModel:
             try:
                 project = gazu.project.get_project(project_id) or None
             except Exception as exc:
-                print(f"[KitsuReview] Could not fetch project {project_id}: {exc}")
+                print(
+                    f"[KitsuReview] Could not fetch project {project_id}: {exc}"
+                )
                 project = None
             self._project_cache[project_id] = project
         return self._project_cache[project_id]
@@ -1377,8 +1695,10 @@ class KitsuReviewModel:
         project = self._project(project_id) or {}
         fps = _parse_fps(project.get("fps"))
         if fps is None:
-            print(f"[KitsuReview] Project {project.get('name') or project_id!r} has no "
-                  f"usable FPS ({project.get('fps')!r}); using {format_fps(DEFAULT_FPS)}.")
+            print(
+                f"[KitsuReview] Project {project.get('name') or project_id!r} has no "
+                f"usable FPS ({project.get('fps')!r}); using {format_fps(DEFAULT_FPS)}."
+            )
             return DEFAULT_FPS, False
         return fps, True
 
@@ -1399,9 +1719,13 @@ class KitsuReviewModel:
                 continue
             if project_ids and sid not in project_ids:
                 continue
-            if role in _ARTIST_ROLES and not status.get("is_artist_allowed", True):
+            if role in _ARTIST_ROLES and not status.get(
+                "is_artist_allowed", True
+            ):
                 continue
-            if role in _CLIENT_ROLES and not status.get("is_client_allowed", True):
+            if role in _CLIENT_ROLES and not status.get(
+                "is_client_allowed", True
+            ):
                 continue
             result.append(status)
 
@@ -1458,7 +1782,9 @@ class KitsuReviewModel:
         Kitsu sets the task's status to the comment's. Returns True if the
         task's status changed (the revision is updated locally)."""
         task = rev["task"]
-        task_status = self.status_for_id(status_id) or gazu.task.get_task_status(status_id)
+        task_status = self.status_for_id(
+            status_id
+        ) or gazu.task.get_task_status(status_id)
         comment = gazu.task.add_comment(
             task,
             task_status,
@@ -1475,13 +1801,17 @@ class KitsuReviewModel:
     # Download / load into RV
     # ------------------------------------------------------------------
 
-    def download_preview(self, rev, on_progress: Optional[Callable[[int], None]] = None):
+    def download_preview(
+        self, rev, on_progress: Optional[Callable[[int], None]] = None
+    ):
         """Download the revision's preview file; returns the local path.
         on_progress receives a 0-100 percentage. Raises on failure."""
         preview_file = rev["preview_file"]
 
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        original_name = preview_file.get("original_name") or preview_file.get("id", "revision")
+        original_name = preview_file.get("original_name") or preview_file.get(
+            "id", "revision"
+        )
         extension = preview_file.get("extension") or "mov"
         file_name = str(original_name)
         if not file_name.lower().endswith(f".{extension.lower()}"):
@@ -1489,7 +1819,11 @@ class KitsuReviewModel:
         file_path = os.path.join(DOWNLOAD_DIR, file_name)
 
         def _progress_callback(size, total_size):
-            pct = int(min(100, max(0, (size / total_size) * 100))) if total_size else 0
+            pct = (
+                int(min(100, max(0, (size / total_size) * 100)))
+                if total_size
+                else 0
+            )
             if on_progress:
                 on_progress(pct)
 
@@ -1517,20 +1851,30 @@ class KitsuReviewModel:
             try:
                 rev["source_group"] = rvc.nodeGroup(source_node)
             except Exception as exc:
-                print(f"[KitsuReview] Could not find the group of {source_node}: {exc}")
+                print(
+                    f"[KitsuReview] Could not find the group of {source_node}: {exc}"
+                )
 
         is_still = _is_still(preview_file)
-        base_frame = self.rv.source_start_frame(source_node) if (source_node and is_still) else 1
+        base_frame = (
+            self.rv.source_start_frame(source_node)
+            if (source_node and is_still)
+            else 1
+        )
         rev["base_frame"] = base_frame
 
         skipped = False
         try:
-            width, height = _preview_dimensions(preview_file, rev.get("entity"), file_path)
+            width, height = _preview_dimensions(
+                preview_file, rev.get("entity"), file_path
+            )
         except ValueError as exc:
             rev["width"] = rev["height"] = None
             openrv_annotations = []
             skipped = True
-            print(f"[KitsuReview] {exc} Existing annotations will not be loaded.")
+            print(
+                f"[KitsuReview] {exc} Existing annotations will not be loaded."
+            )
         else:
             rev["width"], rev["height"] = width, height
             openrv_annotations = convertToORV(
@@ -1546,7 +1890,9 @@ class KitsuReviewModel:
                     shape["frame"] = base_frame
 
         if source_node and openrv_annotations:
-            self.rv.apply_annotations_live(self.rv.paint_node_for(source_node), openrv_annotations)
+            self.rv.apply_annotations_live(
+                self.rv.paint_node_for(source_node), openrv_annotations
+            )
 
         rev["loaded"] = True
         return skipped
@@ -1560,7 +1906,9 @@ class KitsuReviewModel:
         Raises DimensionsUnknownError if it can't be determined."""
         width, height = rev.get("width"), rev.get("height")
         if not (width and height):
-            width, height = _preview_dimensions(rev["preview_file"], rev.get("entity"))
+            width, height = _preview_dimensions(
+                rev["preview_file"], rev.get("entity")
+            )
             rev["width"], rev["height"] = width, height
         return width, height
 
@@ -1613,9 +1961,13 @@ class KitsuReviewModel:
         DimensionsUnknownError if the size is unknown, or the server's
         error if the push fails."""
         try:
-            n_comments = len(gazu.task.all_comments_for_task(rev["task"]) or [])
+            n_comments = len(
+                gazu.task.all_comments_for_task(rev["task"]) or []
+            )
         except Exception as exc:
-            print(f"[KitsuReview] Could not fetch comment count for export summary: {exc}")
+            print(
+                f"[KitsuReview] Could not fetch comment count for export summary: {exc}"
+            )
             n_comments = fallback_comment_count
 
         annotations = self.rv.gather_annotations(self.export_paint_nodes(rev))
@@ -1628,12 +1980,18 @@ class KitsuReviewModel:
         self.resolve_dimensions(rev)
         records = self.kitsu_records_for(rev, annotations)
         preview_file = rev["preview_file"]
-        additions, updates = split_annotation_changes(records, preview_file.get("annotations"))
+        additions, updates = split_annotation_changes(
+            records, preview_file.get("annotations")
+        )
         if additions or updates:
-            result = self._push_to_kitsu(preview_file["id"], additions, updates, [])
+            result = self._push_to_kitsu(
+                preview_file["id"], additions, updates, []
+            )
             # Match the next export against what Kitsu now stores, not
             # against what it had when the revision list was loaded.
-            if isinstance(result, dict) and isinstance(result.get("annotations"), list):
+            if isinstance(result, dict) and isinstance(
+                result.get("annotations"), list
+            ):
                 preview_file["annotations"] = result["annotations"]
 
         def count(groups):
@@ -1656,7 +2014,9 @@ class KitsuReviewModel:
             return None
         playlist = self.playlist_for_revision(rev)
         return {
-            "source": f"playlist {playlist['name']!r}" if playlist else "My Checks",
+            "source": (
+                f"playlist {playlist['name']!r}" if playlist else "My Checks"
+            ),
             "shot": rev["shot"],
             "task_type": rev["task_type"],
             "revision": rev["revision"],
@@ -1674,7 +2034,9 @@ class KitsuReviewModel:
         try:
             payload, status = self._dev_payload(view, current_source_only)
         except Exception as exc:
-            payload, status = {"error": f"{type(exc).__name__}: {exc}"}, "Error building view"
+            payload, status = {
+                "error": f"{type(exc).__name__}: {exc}"
+            }, "Error building view"
         return json.dumps(payload, indent=2, default=_json_default), status
 
     def _dev_payload(self, view, current_source_only):
@@ -1685,20 +2047,34 @@ class KitsuReviewModel:
 
         if current_source_only:
             sources, paint_nodes = self.rv.current_source_paint_nodes()
-            scope = {"scope": "current source", "sources": sources, "paint_nodes": paint_nodes}
+            scope = {
+                "scope": "current source",
+                "sources": sources,
+                "paint_nodes": paint_nodes,
+            }
         else:
             # What Export reads for the selected revision.
             rev = self.current_revision
             paint_nodes = self.export_paint_nodes(rev) if rev else None
-            scope = ({"scope": "export (selected revision's source)", "paint_nodes": paint_nodes}
-                     if paint_nodes else {"scope": "all paint nodes"})
+            scope = (
+                {
+                    "scope": "export (selected revision's source)",
+                    "paint_nodes": paint_nodes,
+                }
+                if paint_nodes
+                else {"scope": "all paint nodes"}
+            )
 
         annotations = self.rv.gather_annotations(paint_nodes)
         frames = sorted({a["frame"] for a in annotations})
         context = {"current_frame": frame, **scope, "annotated_frames": frames}
 
         if view == DevView.RV:
-            payload = {**context, "shape_count": len(annotations), "annotations": annotations}
+            payload = {
+                **context,
+                "shape_count": len(annotations),
+                "annotations": annotations,
+            }
             status = f"{len(annotations)} shape(s) on {len(frames)} frame(s)"
             return payload, status
 
@@ -1706,15 +2082,24 @@ class KitsuReviewModel:
         rev = self.current_revision
         if not rev:
             return (
-                {**context, "error": "Select a revision on the Review tab -- the "
-                 "conversion needs its pixel dimensions and frame base."},
+                {
+                    **context,
+                    "error": "Select a revision on the Review tab -- the "
+                    "conversion needs its pixel dimensions and frame base.",
+                },
                 "No revision selected",
             )
         try:
             records = self.kitsu_records_for(rev, annotations)
         except ValueError as exc:
-            return ({**context, "revision": self._revision_summary(), "error": str(exc)},
-                    "Could not convert (unknown dimensions)")
+            return (
+                {
+                    **context,
+                    "revision": self._revision_summary(),
+                    "error": str(exc),
+                },
+                "Could not convert (unknown dimensions)",
+            )
         payload = {
             **context,
             "revision": self._revision_summary(),
@@ -1729,7 +2114,9 @@ class KitsuReviewModel:
         if not self.logged_in:
             return {"error": "Not logged in to Kitsu."}, "Not logged in"
         if not rev:
-            return {"error": "Select a revision on the Review tab."}, "No revision selected"
+            return {
+                "error": "Select a revision on the Review tab."
+            }, "No revision selected"
 
         preview_file = rev["preview_file"]
         source = "server"
@@ -1737,9 +2124,13 @@ class KitsuReviewModel:
             fresh = gazu.files.get_preview_file(preview_file["id"]) or {}
             annotations = fresh.get("annotations")
         except Exception as exc:
-            print(f"[KitsuReview] Could not re-fetch preview file {preview_file.get('id')}: {exc}")
+            print(
+                f"[KitsuReview] Could not re-fetch preview file {preview_file.get('id')}: {exc}"
+            )
             annotations = preview_file.get("annotations")
-            source = f"cached at last Refresh Revisions (re-fetch failed: {exc})"
+            source = (
+                f"cached at last Refresh Revisions (re-fetch failed: {exc})"
+            )
 
         annotations = annotations or []
         payload = {

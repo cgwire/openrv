@@ -4,6 +4,7 @@ from Kitsu and store them in test_video.json.
 
 Requires: pip install gazu
 """
+
 import json
 
 import gazu
@@ -32,7 +33,9 @@ def get_task_annotations(task):
     previews = []
     for comment in gazu.task.all_comments_for_task(task):
         for preview in comment.get("previews", []):
-            preview_id = preview["id"] if isinstance(preview, dict) else preview
+            preview_id = (
+                preview["id"] if isinstance(preview, dict) else preview
+            )
             preview_file = gazu.files.get_preview_file(preview_id)
             previews.append(
                 {
