@@ -39,7 +39,8 @@ Shared with zou and gazu:
 - **f-strings only** in new or edited code. Multi-line: implicit concatenation, not `+`.
 - **Imports sorted alphabetically** inside a parenthesized `from x import (...)` block. Adding a name to an unsorted block means sorting the whole block.
 - **No parentheses around tuples** where they add nothing: `return a, b`.
-- **Docstrings**: in new code, opening and closing `"""` each on their own line, even for one-liners. Don't rewrite existing ones just for this.
+- **Docstrings**: opening and closing `"""` each on their own line, even for one-liners.
+- **Comments and docstrings are written in [ASD-STE100](https://www.asd-ste100.org/)** Simplified Technical English: short sentences (20 words for an instruction, 25 for a description), active voice, simple tenses, one topic per sentence, no contractions. Technical names stay as they are. Log messages and UI text are not covered.
 - **Comments** only for the non-obvious why. Eraser and coordinate conversions usually qualify.
 - **Naming**: `snake_case` functions, verb-first. `convertToKitsu` and `convertToORV` are public names: don't copy the camelCase and don't rename them.
 - No em-dashes in prose, comments, commit or PR text.
